@@ -355,13 +355,48 @@ def train(args):
         )
     predict_orientation, environment_config = read_dataset_config(paths)
     state_keys = STATE_KEYS + (("robot0_eef_quat",) if predict_orientation else ())
-    random.Random(args.seed).shuffle(paths)
-    n_val = max(1, round(len(paths) * args.val_fraction))
-    val_paths, train_paths = paths[:n_val], paths[n_val:]
+    output = Path(args.output)
+    if args.resume and output.resolve() != Path(args.resume).resolve().parent:
+        raise ValueError("--output must be the directory containing --resume")
+    checkpoint = (
+        torch.load(args.resume, map_location="cpu", weights_only=False)
+        if args.resume else None
+    )
+    if checkpoint is not None:
+        if checkpoint.get("predict_orientation", False) != predict_orientation:
+            raise ValueError("Checkpoint orientation mode differs from dataset")
+        if checkpoint_environment_config(checkpoint) != environment_config:
+            raise ValueError("Checkpoint object rotation settings differ from dataset")
+        if tuple(checkpoint.get("state_keys", STATE_KEYS)) != state_keys:
+            raise ValueError("Checkpoint state keys differ from dataset")
+        split = checkpoint.get("split")
+        if split is None:
+            split_path = Path(args.resume).parent / "split.json"
+            if not split_path.is_file():
+                raise ValueError(f"Cannot resume: missing training split {split_path}")
+            split = json.loads(split_path.read_text())
+        by_name = {path.name: path for path in paths}
+        train_names, val_names = split["train"], split["val"]
+        if (len(train_names) + len(val_names) != len(paths)
+                or len(set(train_names + val_names)) != len(paths)
+                or set(train_names + val_names) != set(by_name)):
+            raise ValueError("Dataset files differ from checkpoint training split")
+        train_paths = [by_name[name] for name in train_names]
+        val_paths = [by_name[name] for name in val_names]
+    else:
+        random.Random(args.seed).shuffle(paths)
+        n_val = max(1, round(len(paths) * args.val_fraction))
+        val_paths, train_paths = paths[:n_val], paths[n_val:]
+        split = {"train": [p.name for p in train_paths],
+                 "val": [p.name for p in val_paths]}
     state_dims = {read_demo_info(p, state_keys)[1] for p in paths}
     if len(state_dims) != 1:
         raise RuntimeError(f"Inconsistent state dimensions: {state_dims}")
-    stats = compute_stats(train_paths, predict_orientation, state_keys)
+    stats = checkpoint["stats"] if checkpoint is not None else compute_stats(
+        train_paths, predict_orientation, state_keys
+    )
+    if len(stats["state_mean"]) != next(iter(state_dims)):
+        raise ValueError("Checkpoint state dimension differs from dataset")
     train_set = EpisodeDataset(train_paths, state_keys=state_keys, **stats)
     val_set = EpisodeDataset(val_paths, state_keys=state_keys, **stats)
     train_loader = DataLoader(
@@ -375,17 +410,24 @@ def train(args):
     )
     model = BCPolicy(state_dims.pop(), predict_orientation=predict_orientation).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    output = Path(args.output)
+    start_epoch = 1
+    best = float("inf")
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint["model"])
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best = float(checkpoint["best_val_loss"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            for group in optimizer.param_groups:
+                group["lr"] = args.lr
+        else:
+            print("Checkpoint lama: optimizer tidak tersimpan; optimizer dimulai ulang.", flush=True)
+        if start_epoch > args.epochs:
+            raise ValueError(
+                f"Checkpoint is at epoch {start_epoch - 1}; --epochs must be greater"
+            )
     output.mkdir(parents=True, exist_ok=True)
-    (output / "split.json").write_text(
-        json.dumps(
-            {
-                "train": [p.name for p in train_paths],
-                "val": [p.name for p in val_paths],
-            },
-            indent=2,
-        )
-    )
+    (output / "split.json").write_text(json.dumps(split, indent=2))
     run = init_wandb(
         args,
         "train",
@@ -412,34 +454,39 @@ def train(args):
     if run is not None:
         print(f"W&B dashboard: {run.url}", flush=True)
         log_training_camera_samples(run, val_paths)
-    best = float("inf")
     print(f"Orientation actions: {predict_orientation} | State keys: {state_keys}", flush=True)
+    if checkpoint is not None:
+        print(f"Resuming from epoch {start_epoch - 1} to {args.epochs}", flush=True)
     print(
         f"Train: {len(train_paths)} episodes/{len(train_set)} transitions | "
         f"Validation: {len(val_paths)} episodes/{len(val_set)} transitions | Device: {device}",
         flush=True,
     )
     try:
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             tr = epoch_pass(model, train_loader, device, optimizer)
             va = epoch_pass(model, val_loader, device)
             improved = va[0] < best
             if improved:
                 best = va[0]
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "stats": stats,
-                        "state_dim": len(stats["state_mean"]),
-                        "epoch": epoch,
-                        "best_val_loss": best,
-                        "state_keys": state_keys,
-                        "image_key": IMAGE_KEY,
-                        "predict_orientation": predict_orientation,
-                        "environment_config": environment_config,
-                    },
-                    output / "bc_best.pt",
-                )
+            saved = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "stats": stats,
+                "state_dim": len(stats["state_mean"]),
+                "epoch": epoch,
+                "best_val_loss": best,
+                "state_keys": state_keys,
+                "image_key": IMAGE_KEY,
+                "predict_orientation": predict_orientation,
+                "environment_config": environment_config,
+                "split": split,
+            }
+            if improved:
+                torch.save(saved, output / "bc_best.pt")
+            latest_tmp = output / "bc_last.pt.tmp"
+            torch.save(saved, latest_tmp)
+            latest_tmp.replace(output / "bc_last.pt")
             print(
                 f"Epoch {epoch:03d}/{args.epochs}: train={tr[0]:.5f} "
                 f"val={va[0]:.5f} (xyz={va[1]:.5f}, rotation={va[3]:.5f}, "
@@ -905,6 +952,10 @@ def main():
     t.add_argument("--val-fraction", type=float, default=0.1)
     t.add_argument("--seed", type=int, default=123)
     t.add_argument("--cpu", action="store_true")
+    t.add_argument(
+        "--resume", default=None,
+        help="Resume training from bc_last.pt (or an older bc_best.pt); --epochs is the total target epoch",
+    )
     e = sub.add_parser("eval")
     e.add_argument("--checkpoint", default="checkpoints/bc_best.pt")
     e.add_argument("--episodes", type=int, default=20, help="Episodes per seed")

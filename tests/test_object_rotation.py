@@ -175,6 +175,34 @@ class ObjectRotationTests(unittest.TestCase):
         self.assertEqual(legacy["head.4.weight"].shape, (4, 128))
         bc.BCPolicy(12, predict_orientation=False).load_state_dict(legacy)
 
+    def test_training_resume_keeps_epoch_optimizer_and_split(self):
+        self.write_demo(False, "demo_00000.hdf5")
+        self.write_demo(False, "demo_00001.hdf5")
+        output = self.directory / "checkpoints"
+        args = SimpleNamespace(
+            dataset=str(self.directory), output=str(output), epochs=1,
+            batch_size=128, lr=1e-4, val_fraction=0.5, seed=123,
+            cpu=True, resume=None, wandb=False,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.train(args)
+        first = torch.load(output / "bc_last.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(first["epoch"], 1)
+        self.assertIn("optimizer", first)
+        self.assertTrue((output / "bc_best.pt").is_file())
+        args.resume = str(output / "bc_last.pt")
+        args.epochs = 2
+        args.seed = 999  # The saved split must prevail over a different CLI seed.
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.train(args)
+        second = torch.load(output / "bc_last.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(second["epoch"], 2)
+        self.assertEqual(second["split"], first["split"])
+        self.assertEqual(second["stats"], first["stats"])
+        self.assertGreaterEqual(
+            next(iter(second["optimizer"]["state"].values()))["step"], 2
+        )
+
     def test_mixed_modes_are_rejected(self):
         fixed, _ = self.write_demo(False, "demo_00000.hdf5")
         rotated, _ = self.write_demo(True, "demo_00001.hdf5")
