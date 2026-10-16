@@ -1,3 +1,4 @@
+import argparse
 import time
 from pathlib import Path
 
@@ -9,9 +10,20 @@ from robosuite.environments.manipulation.lift import Lift
 from robosuite.models.arenas import TableArena
 from robosuite.models.objects import BoxObject
 from robosuite.models.tasks import ManipulationTask
-from robosuite.utils.placement_samplers import (
-    SequentialCompositeSampler,
-    UniformRandomSampler,
+
+from cube_placement import (
+    CUBE_X_RANGE,
+    CUBE_Y_RANGE,
+    DEFAULT_OBJECT_YAW_RANGE_DEG,
+    MIN_CUBE_DISTANCE,
+    MinimumDistanceSampler,
+    object_rotation_range,
+)
+from expert_orientation import (
+    ORIENTATION_TOLERANCE,
+    grasp_orientation,
+    orientation_command,
+    orientation_distance,
 )
 
 # ============================================================
@@ -77,6 +89,17 @@ np.random.seed(SEED)
 
 class ThreeCubeLift(Lift):
 
+    def __init__(
+        self, *args, random_object_rotation=False,
+        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG, **kwargs,
+    ):
+        self.random_object_rotation = bool(random_object_rotation)
+        self.object_yaw_range_deg = float(object_yaw_range_deg)
+        self.object_rotation = object_rotation_range(
+            self.random_object_rotation, self.object_yaw_range_deg
+        )
+        super().__init__(*args, **kwargs)
+
     def _load_model(self):
 
         super(Lift, self)._load_model()
@@ -125,47 +148,19 @@ class ThreeCubeLift(Lift):
             self.green_cube,
         ]
 
-        sampler = SequentialCompositeSampler(name="ThreeCubeSampler")
-
-        configs = [
-            (
-                "RedSampler",
-                self.cube,
-                [-0.03, 0.03],
-                [-0.03, 0.03],
-            ),
-            (
-                "BlueSampler",
-                self.blue_cube,
-                [-0.06, 0.06],
-                [0.11, 0.17],
-            ),
-            (
-                "GreenSampler",
-                self.green_cube,
-                [-0.06, 0.06],
-                [-0.17, -0.11],
-            ),
-        ]
-
-        for name, obj, x_range, y_range in configs:
-
-            sampler.append_sampler(
-                UniformRandomSampler(
-                    name=name,
-                    mujoco_objects=obj,
-                    x_range=x_range,
-                    y_range=y_range,
-                    rotation=None,
-                    ensure_object_boundary_in_range=False,
-                    ensure_valid_placement=True,
-                    reference_pos=self.table_offset,
-                    z_offset=0.01,
-                    rng=self.rng,
-                )
-            )
-
-        self.placement_initializer = sampler
+        self.placement_initializer = MinimumDistanceSampler(
+            name="ThreeCubeSampler",
+            mujoco_objects=cubes,
+            x_range=CUBE_X_RANGE,
+            y_range=CUBE_Y_RANGE,
+            minimum_distance=MIN_CUBE_DISTANCE,
+            rotation=self.object_rotation,
+            ensure_object_boundary_in_range=True,
+            ensure_valid_placement=True,
+            reference_pos=self.table_offset,
+            z_offset=0.01,
+            rng=self.rng,
+        )
 
         self.model = ManipulationTask(
             mujoco_arena=arena,
@@ -194,7 +189,10 @@ class ThreeCubeLift(Lift):
 # ============================================================
 
 
-def create_env():
+def create_env(
+    random_object_rotation=False,
+    object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+):
 
     controller = load_composite_controller_config(
         controller="BASIC",
@@ -206,11 +204,15 @@ def create_env():
     right["type"] = "OSC_POSE"
     right["input_type"] = "delta"
     right["impedance_mode"] = "fixed"
+    if random_object_rotation:
+        right["input_ref_frame"] = "world"
 
     controller["body_parts"] = {"right": right}
 
     env = ThreeCubeLift(
         robots="Panda",
+        random_object_rotation=random_object_rotation,
+        object_yaw_range_deg=object_yaw_range_deg,
         controller_configs=controller,
         initialization_noise={
             "magnitude": JOINT_NOISE_RAD,
@@ -252,7 +254,7 @@ def get_target(cube, height):
     )
 
 
-def move_toward(env, obs, target, gripper, state):
+def move_toward(env, obs, target, gripper, state, target_orientation=None):
 
     eef = obs["robot0_eef_pos"]
     error = target - eef
@@ -267,7 +269,7 @@ def move_toward(env, obs, target, gripper, state):
         limit,
     )
 
-    action[3:6] = 0.0
+    action[3:6] = orientation_command(obs, target_orientation)
     action[6] = gripper
 
     low, high = env.action_spec
@@ -293,7 +295,11 @@ def run_episode(env):
     obs = env.reset()
 
     initial_cube = obs["cube_pos"].copy()
+    initial_cube_quat = obs["cube_quat"].copy()
     initial_joints = obs["robot0_joint_pos"].copy()
+    target_orientation = (
+        grasp_orientation(obs) if env.random_object_rotation else None
+    )
 
     initial_blue, initial_green = env.get_distractor_positions()
 
@@ -330,6 +336,9 @@ def run_episode(env):
 
         cube = obs["cube_pos"].copy()
         eef = obs["robot0_eef_pos"].copy()
+        orientation_ok = (
+            orientation_distance(obs, target_orientation) < ORIENTATION_TOLERANCE
+        )
 
         if state == "approach":
 
@@ -348,7 +357,7 @@ def run_episode(env):
             xy_error = np.linalg.norm(eef[:2] - target[:2])
             z_error = abs(eef[2] - target[2])
 
-            if xy_error < 0.012 and z_error < 0.020:
+            if xy_error < 0.012 and z_error < 0.020 and orientation_ok:
                 state = "descend"
                 state_steps = 0
 
@@ -360,7 +369,7 @@ def run_episode(env):
             xy_error = np.linalg.norm(eef[:2] - target[:2])
             z_error = abs(eef[2] - target[2])
 
-            if xy_error < 0.008 and z_error < 0.012:
+            if xy_error < 0.008 and z_error < 0.012 and orientation_ok:
                 state = "grasp"
                 state_steps = 0
 
@@ -404,6 +413,7 @@ def run_episode(env):
             target,
             grip,
             state,
+            target_orientation=target_orientation,
         )
 
         # Record the observation BEFORE the action.
@@ -458,6 +468,7 @@ def run_episode(env):
         "blue_shift": float(np.linalg.norm(final_blue - initial_blue)),
         "green_shift": float(np.linalg.norm(final_green - initial_green)),
         "initial_cube": initial_cube,
+        "initial_cube_quat": initial_cube_quat,
         "initial_blue": initial_blue,
         "initial_green": initial_green,
         "initial_joints": initial_joints,
@@ -515,6 +526,7 @@ def save_demonstration(h5file, demo_id, result):
         "initial_cube",
         data=result["initial_cube"],
     )
+    group.create_dataset("initial_cube_quat", data=result["initial_cube_quat"])
 
     group.create_dataset("initial_blue", data=result["initial_blue"])
     group.create_dataset("initial_green", data=result["initial_green"])
@@ -580,6 +592,14 @@ def save_episode_file(demo_id, result, env):
         h5file.attrs["control_freq"] = CONTROL_FREQ
         h5file.attrs["seed"] = SEED
         h5file.attrs["joint_noise_deg"] = JOINT_NOISE_DEG
+        h5file.attrs["cube_x_range"] = CUBE_X_RANGE
+        h5file.attrs["cube_y_range"] = CUBE_Y_RANGE
+        h5file.attrs["min_cube_distance_m"] = MIN_CUBE_DISTANCE
+        h5file.attrs["random_object_rotation"] = env.random_object_rotation
+        h5file.attrs["control_orientation"] = env.random_object_rotation
+        h5file.attrs["object_yaw_range_deg"] = (
+            env.object_yaw_range_deg if env.random_object_rotation else 0.0
+        )
         h5file.attrs["target_lift_m"] = LIFT_HEIGHT
         h5file.attrs["lift_tolerance_m"] = LIFT_TOLERANCE
         h5file.attrs["image_height"] = IMAGE_HEIGHT
@@ -595,8 +615,29 @@ def save_episode_file(demo_id, result, env):
 # ============================================================
 
 
-def collect():
+def collect(
+    random_object_rotation=False,
+    object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+    num_demos=None,
+    max_attempts=None,
+):
+    num_demos = NUM_DEMOS if num_demos is None else num_demos
+    max_attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for path in OUTPUT_DIR.glob("demo_*.hdf5"):
+        with h5py.File(path, "r") as file:
+            if (
+                bool(file.attrs.get("control_orientation", False)) != random_object_rotation
+                or bool(file.attrs.get("random_object_rotation", True)) != random_object_rotation
+            ):
+                raise ValueError(
+                    f"{path}: orientation mode differs; choose a separate --output directory"
+                )
+            if random_object_rotation and not np.isclose(
+                file.attrs.get("object_yaw_range_deg", np.nan), object_yaw_range_deg
+            ):
+                raise ValueError(f"{path}: object yaw range differs from this collection")
 
     existing_ids = existing_demo_ids()
     saved = len(existing_ids)
@@ -609,31 +650,37 @@ def collect():
     print("=" * 65)
     print("THREE-CUBE DEMONSTRATION COLLECTION")
     print("=" * 65)
-    print(f"Target demonstrations: {NUM_DEMOS}")
+    print(f"Target demonstrations: {num_demos}")
     print(f"Existing files:        {saved}")
     print(f"Next demo ID:          {next_id:05d}")
-    print(f"Maximum new attempts:  {MAX_ATTEMPTS}")
+    print(f"Maximum new attempts:  {max_attempts}")
     print(f"Camera:                {CAMERA_NAMES}")
     print(f"Image resolution:      {IMAGE_WIDTH}x{IMAGE_HEIGHT}")
     print(f"Control frequency:     {CONTROL_FREQ} Hz")
+    print(f"Cube placement X/Y:    {CUBE_X_RANGE} / {CUBE_Y_RANGE} m")
+    print(f"Minimum cube spacing:  {MIN_CUBE_DISTANCE:.2f} m (XY centers)")
+    print(f"Random object yaw:     {random_object_rotation}")
+    if random_object_rotation:
+        print(f"Object yaw range:      +/-{object_yaw_range_deg:g} degrees")
+    print(f"Orientation actions:   {random_object_rotation}")
     print(f"Minimum cube lift:     {LIFT_HEIGHT - LIFT_TOLERANCE:.2f} m")
     print(f"Output directory:      {OUTPUT_DIR}")
     print("=" * 65, flush=True)
 
-    if saved >= NUM_DEMOS:
+    if saved >= num_demos:
         print("Target already reached. No new episodes needed.")
         return
 
-    env = create_env()
+    env = create_env(random_object_rotation, object_yaw_range_deg)
     attempts = 0
     new_saved = 0
     total_steps = 0
     start_time = time.perf_counter()
 
     try:
-        while saved < NUM_DEMOS and attempts < MAX_ATTEMPTS:
+        while saved < num_demos and attempts < max_attempts:
             attempts += 1
-            print(f"\n[Attempt {attempts:04d} | saved {saved}/{NUM_DEMOS}]", flush=True)
+            print(f"\n[Attempt {attempts:04d} | saved {saved}/{num_demos}]", flush=True)
             result = run_episode(env)
 
             if result["success"]:
@@ -644,7 +691,7 @@ def collect():
                 new_saved += 1
                 total_steps += result["steps"]
                 print(
-                    f"[{attempts:04d}] SUCCESS | Saved {saved}/{NUM_DEMOS} | "
+                    f"[{attempts:04d}] SUCCESS | Saved {saved}/{num_demos} | "
                     f"Steps {result['steps']} | Lift {result['final_lift']:.3f}m | "
                     f"Blue {result['blue_shift']:.3f}m | "
                     f"Green {result['green_shift']:.3f}m",
@@ -667,7 +714,7 @@ def collect():
     print("=" * 65)
     print(f"New attempts:       {attempts}")
     print(f"Newly saved demos:  {new_saved}")
-    print(f"Total saved demos:  {saved}/{NUM_DEMOS}")
+    print(f"Total saved demos:  {saved}/{num_demos}")
     print(f"Rejected episodes:  {attempts - new_saved}")
     print(
         f"Acceptance rate:    {100 * new_saved / attempts:.2f}%"
@@ -680,5 +727,35 @@ def collect():
     print("=" * 65)
 
 
+def main():
+    global OUTPUT_DIR, RENDER
+    parser = argparse.ArgumentParser(description="Collect successful three-cube Lift demos")
+    parser.add_argument("--random-object-rotation", action="store_true",
+                        help="Randomize object yaw and control gripper orientation")
+    parser.add_argument("--object-yaw-range-deg", type=float,
+                        default=DEFAULT_OBJECT_YAW_RANGE_DEG,
+                        help="Symmetric object yaw range in degrees (default: +/-45)")
+    parser.add_argument("--num-demos", type=int, default=NUM_DEMOS)
+    parser.add_argument("--max-attempts", type=int, default=MAX_ATTEMPTS)
+    parser.add_argument("--output", type=Path,
+                        help="Dataset directory; rotation mode defaults to a separate directory")
+    parser.add_argument("--render", action="store_true", default=RENDER)
+    args = parser.parse_args()
+    if args.num_demos < 1 or args.max_attempts < 1:
+        parser.error("--num-demos and --max-attempts must be positive")
+    try:
+        object_rotation_range(args.random_object_rotation, args.object_yaw_range_deg)
+    except ValueError as error:
+        parser.error(str(error))
+
+    if args.output is not None:
+        OUTPUT_DIR = args.output
+    elif args.random_object_rotation:
+        OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_rotation")
+    RENDER = args.render
+    collect(args.random_object_rotation, args.object_yaw_range_deg,
+            num_demos=args.num_demos, max_attempts=args.max_attempts)
+
+
 if __name__ == "__main__":
-    collect()
+    main()

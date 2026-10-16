@@ -59,14 +59,16 @@ def main():
         "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = bc.BCPolicy(checkpoint["state_dim"]).to(device)
+    model = bc.BCPolicy(
+        checkpoint["state_dim"],
+        predict_orientation=checkpoint.get("predict_orientation", False),
+    ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     stats = checkpoint["stats"]
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
-    xyz_mean = np.asarray(stats["xyz_mean"], dtype=np.float32)
-    xyz_std = np.asarray(stats["xyz_std"], dtype=np.float32)
+    environment_config = bc.checkpoint_environment_config(checkpoint)
     image_key = checkpoint.get("image_key", "agentview_image")
     state_keys = tuple(
         checkpoint.get(
@@ -94,7 +96,7 @@ def main():
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
-            env = collector.create_env()
+            env = collector.create_env(**environment_config)
             try:
                 # Match per-attempt seed to the environment's placement RNG.
                 if hasattr(env, "rng"):
@@ -154,10 +156,10 @@ def main():
                                 .to(device)
                             )
                             with torch.no_grad():
-                                xyz, grip = model(image, state)
-                            action = np.zeros(7, dtype=np.float32)
-                            action[:3] = xyz[0].cpu().numpy() * xyz_std + xyz_mean
-                            action[6] = 1.0 if grip.item() > 0 else -1.0
+                                motion, grip = model(image, state)
+                            action = bc.action_from_prediction(
+                                motion[0].cpu().numpy(), grip.item(), stats
+                            )
                             obs, _, _, _ = env.step(np.clip(action, low, high))
                             if args.render:
                                 env.render()
@@ -231,6 +233,8 @@ def main():
                     "attempt_success_rate": successes / len(rows) if rows else None,
                     "success_threshold_m": threshold,
                     "hold_steps": hold_steps,
+                    "predict_orientation": model.predict_orientation,
+                    "environment_config": environment_config,
                 },
                 indent=2,
             )

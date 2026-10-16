@@ -1,3 +1,4 @@
+import argparse
 import time
 
 import numpy as np
@@ -7,9 +8,20 @@ from robosuite.environments.manipulation.lift import Lift
 from robosuite.models.arenas import TableArena
 from robosuite.models.objects import BoxObject
 from robosuite.models.tasks import ManipulationTask
-from robosuite.utils.placement_samplers import (
-    SequentialCompositeSampler,
-    UniformRandomSampler,
+
+from cube_placement import (
+    CUBE_X_RANGE,
+    CUBE_Y_RANGE,
+    DEFAULT_OBJECT_YAW_RANGE_DEG,
+    MIN_CUBE_DISTANCE,
+    MinimumDistanceSampler,
+    object_rotation_range,
+)
+from expert_orientation import (
+    ORIENTATION_TOLERANCE,
+    grasp_orientation,
+    orientation_command,
+    orientation_distance,
 )
 
 # ============================================================
@@ -63,6 +75,17 @@ np.random.seed(SEED)
 
 class ThreeCubeLift(Lift):
 
+    def __init__(
+        self, *args, random_object_rotation=False,
+        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG, **kwargs,
+    ):
+        self.random_object_rotation = bool(random_object_rotation)
+        self.object_yaw_range_deg = float(object_yaw_range_deg)
+        self.object_rotation = object_rotation_range(
+            self.random_object_rotation, self.object_yaw_range_deg
+        )
+        super().__init__(*args, **kwargs)
+
     def _load_model(self):
 
         # Initialize robot model without Lift's single-cube setup
@@ -114,47 +137,19 @@ class ThreeCubeLift(Lift):
             self.green_cube,
         ]
 
-        sampler = SequentialCompositeSampler(name="ThreeCubeSampler")
-
-        placement_configs = [
-            (
-                "RedSampler",
-                self.cube,
-                [-0.03, 0.03],
-                [-0.03, 0.03],
-            ),
-            (
-                "BlueSampler",
-                self.blue_cube,
-                [-0.06, 0.06],
-                [0.11, 0.17],
-            ),
-            (
-                "GreenSampler",
-                self.green_cube,
-                [-0.06, 0.06],
-                [-0.17, -0.11],
-            ),
-        ]
-
-        for name, obj, x_range, y_range in placement_configs:
-
-            object_sampler = UniformRandomSampler(
-                name=name,
-                mujoco_objects=obj,
-                x_range=x_range,
-                y_range=y_range,
-                rotation=None,
-                ensure_object_boundary_in_range=False,
-                ensure_valid_placement=True,
-                reference_pos=self.table_offset,
-                z_offset=0.01,
-                rng=self.rng,
-            )
-
-            sampler.append_sampler(object_sampler)
-
-        self.placement_initializer = sampler
+        self.placement_initializer = MinimumDistanceSampler(
+            name="ThreeCubeSampler",
+            mujoco_objects=cubes,
+            x_range=CUBE_X_RANGE,
+            y_range=CUBE_Y_RANGE,
+            minimum_distance=MIN_CUBE_DISTANCE,
+            rotation=self.object_rotation,
+            ensure_object_boundary_in_range=True,
+            ensure_valid_placement=True,
+            reference_pos=self.table_offset,
+            z_offset=0.01,
+            rng=self.rng,
+        )
 
         self.model = ManipulationTask(
             mujoco_arena=arena,
@@ -183,45 +178,42 @@ class ThreeCubeLift(Lift):
 # CONTROLLER
 # ============================================================
 
-controller = load_composite_controller_config(
-    controller="BASIC",
-    robot="Panda",
-)
+def create_env(
+    random_object_rotation=False,
+    object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+):
+    controller = load_composite_controller_config(controller="BASIC", robot="Panda")
+    right = controller["body_parts"]["right"]
+    right["type"] = "OSC_POSE"
+    right["input_type"] = "delta"
+    right["impedance_mode"] = "fixed"
+    if random_object_rotation:
+        right["input_ref_frame"] = "world"
+    controller["body_parts"] = {"right": right}
 
-controller["body_parts"]["right"]["type"] = "OSC_POSE"
-controller["body_parts"]["right"]["input_type"] = "delta"
-controller["body_parts"]["right"]["impedance_mode"] = "fixed"
+    environment = ThreeCubeLift(
+        robots="Panda",
+        controller_configs=controller,
+        random_object_rotation=random_object_rotation,
+        object_yaw_range_deg=object_yaw_range_deg,
+        initialization_noise={"magnitude": JOINT_NOISE_RAD, "type": "uniform"},
+        renderer=RENDERER,
+        render_camera=RENDER_CAMERA,
+        has_renderer=RENDER,
+        has_offscreen_renderer=False,
+        use_camera_obs=False,
+        use_object_obs=True,
+        control_freq=CONTROL_FREQ,
+        horizon=MAX_STEPS,
+        ignore_done=True,
+        reward_shaping=False,
+    )
+    if environment.action_dim != 7:
+        raise RuntimeError(f"Expected 7D action, got {environment.action_dim}")
+    return environment
 
-controller["body_parts"] = {"right": controller["body_parts"]["right"]}
 
-
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
-env = ThreeCubeLift(
-    robots="Panda",
-    controller_configs=controller,
-    initialization_noise={
-        "magnitude": JOINT_NOISE_RAD,
-        "type": "uniform",
-    },
-    renderer=RENDERER,
-    render_camera=RENDER_CAMERA,
-    has_renderer=RENDER,
-    has_offscreen_renderer=False,
-    use_camera_obs=False,
-    use_object_obs=True,
-    control_freq=CONTROL_FREQ,
-    horizon=MAX_STEPS,
-    ignore_done=True,
-    reward_shaping=False,
-)
-
-low, high = env.action_spec
-
-if env.action_dim != 7:
-    raise RuntimeError(f"Expected 7D action, got {env.action_dim}")
+env = None
 
 
 # ============================================================
@@ -314,7 +306,7 @@ def get_target(cube, height):
     )
 
 
-def move_toward(obs, target, gripper, state):
+def move_toward(obs, target, gripper, state, target_orientation=None):
 
     eef = obs["robot0_eef_pos"]
     error = target - eef
@@ -329,9 +321,10 @@ def move_toward(obs, target, gripper, state):
         limit,
     )
 
-    action[3:6] = 0.0
+    action[3:6] = orientation_command(obs, target_orientation)
     action[6] = gripper
 
+    low, high = env.action_spec
     return np.clip(action, low, high)
 
 
@@ -346,6 +339,9 @@ def run_episode(episode_id):
 
     initial_cube_pos = obs["cube_pos"].copy()
     initial_joint_pos = obs["robot0_joint_pos"].copy()
+    target_orientation = (
+        grasp_orientation(obs) if env.random_object_rotation else None
+    )
 
     initial_blue_pos, initial_green_pos = env.get_distractor_positions()
 
@@ -371,6 +367,9 @@ def run_episode(episode_id):
 
         cube = obs["cube_pos"].copy()
         eef = obs["robot0_eef_pos"].copy()
+        orientation_ok = (
+            orientation_distance(obs, target_orientation) < ORIENTATION_TOLERANCE
+        )
 
         # ----------------------------------------------------
         # APPROACH
@@ -397,7 +396,7 @@ def run_episode(episode_id):
             xy_error = np.linalg.norm(eef[:2] - target[:2])
             z_error = abs(eef[2] - target[2])
 
-            if xy_error < 0.012 and z_error < 0.020:
+            if xy_error < 0.012 and z_error < 0.020 and orientation_ok:
                 state = "descend"
                 state_steps = 0
 
@@ -413,7 +412,7 @@ def run_episode(episode_id):
             xy_error = np.linalg.norm(eef[:2] - target[:2])
             z_error = abs(eef[2] - target[2])
 
-            if xy_error < 0.008 and z_error < 0.012:
+            if xy_error < 0.008 and z_error < 0.012 and orientation_ok:
                 state = "grasp"
                 state_steps = 0
 
@@ -452,6 +451,7 @@ def run_episode(episode_id):
             target=target,
             gripper=grip,
             state=state,
+            target_orientation=target_orientation,
         )
 
         obs, reward, done, info = env.step(action)
@@ -597,14 +597,36 @@ def evaluate():
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+def main():
+    global env, RENDER, NUM_EPISODES
+    parser = argparse.ArgumentParser(description="Evaluate the three-cube scripted expert")
+    parser.add_argument("--random-object-rotation", action="store_true",
+                        help="Randomize object yaw and control gripper orientation")
+    parser.add_argument("--object-yaw-range-deg", type=float,
+                        default=DEFAULT_OBJECT_YAW_RANGE_DEG,
+                        help="Symmetric object yaw range in degrees (default: +/-45)")
+    parser.add_argument("--episodes", type=int, default=NUM_EPISODES)
+    parser.add_argument("--render", action=argparse.BooleanOptionalAction, default=RENDER)
+    args = parser.parse_args()
+    if args.episodes < 1:
+        parser.error("--episodes must be positive")
+    try:
+        object_rotation_range(args.random_object_rotation, args.object_yaw_range_deg)
+    except ValueError as error:
+        parser.error(str(error))
+
+    RENDER = args.render
+    NUM_EPISODES = args.episodes
+    print(f"Random object yaw / orientation actions: {args.random_object_rotation}")
+    if args.random_object_rotation:
+        print(f"Object yaw range: +/-{args.object_yaw_range_deg:g} degrees")
+    env = create_env(args.random_object_rotation, args.object_yaw_range_deg)
 
     try:
 
-        print_viewer_controls()
-
         # Initialize viewer before starting the evaluation.
         if RENDER:
+            print_viewer_controls()
             env.reset()
             env.render()
 
@@ -619,3 +641,7 @@ if __name__ == "__main__":
 
     finally:
         env.close()
+
+
+if __name__ == "__main__":
+    main()

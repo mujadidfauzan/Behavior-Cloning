@@ -4,6 +4,8 @@
 Training: python3 bc_baseline.py train --dataset datasets/three_cube_lift
 Evaluation: python3 bc_baseline.py eval --checkpoint checkpoints/bc_best.pt --episodes 50
 Run from the directory containing collect_demos.py for evaluation.
+Orientation prediction and object yaw settings are inferred from dataset metadata
+and restored from the checkpoint during evaluation.
 """
 
 import argparse
@@ -112,6 +114,48 @@ IMAGE_KEY = "agentview_image"
 STATE_KEYS = ("robot0_joint_pos", "robot0_eef_pos", "robot0_gripper_qpos")
 
 
+def read_dataset_config(paths):
+    """Infer the action head and reset distribution from demonstration metadata."""
+    configurations = set()
+    for path in paths:
+        with h5py.File(path, "r") as file:
+            control_orientation = bool(file.attrs.get("control_orientation", False))
+            # Earlier collectors randomized full yaw but commanded zero rotation.
+            random_rotation = bool(file.attrs.get("random_object_rotation", True))
+            yaw_range = float(file.attrs.get("object_yaw_range_deg", 180.0))
+            configurations.add((control_orientation, random_rotation,
+                                yaw_range if random_rotation else 0.0))
+    if len(configurations) != 1:
+        raise ValueError("Dataset mixes rotation configurations; train each dataset separately")
+    control_orientation, random_rotation, yaw_range = configurations.pop()
+    return control_orientation, {
+        "random_object_rotation": random_rotation,
+        "object_yaw_range_deg": yaw_range if random_rotation else 45.0,
+    }
+
+
+def action_from_prediction(motion, grip_logit, stats):
+    """Denormalize XYZ and optional rotation into the environment's 7D action."""
+    motion = np.asarray(motion, dtype=np.float32)
+    action = np.zeros(7, dtype=np.float32)
+    action[:3] = motion[:3] * np.asarray(stats["xyz_std"]) + stats["xyz_mean"]
+    if len(motion) == 6:
+        action[3:6] = (
+            motion[3:6] * np.asarray(stats["rotation_std"]) + stats["rotation_mean"]
+        )
+    elif len(motion) != 3:
+        raise ValueError(f"Expected 3 or 6 motion values, got {len(motion)}")
+    action[6] = 1.0 if grip_logit > 0 else -1.0
+    return action
+
+
+def checkpoint_environment_config(checkpoint):
+    # Preserve the full-yaw reset distribution of checkpoints predating this flag.
+    return checkpoint.get("environment_config", {
+        "random_object_rotation": True, "object_yaw_range_deg": 180.0,
+    })
+
+
 def seed_all(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -120,14 +164,14 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def read_demo_info(path):
+def read_demo_info(path, state_keys=STATE_KEYS):
     with h5py.File(path, "r") as f:
         names = sorted(f["data"].keys())
         if len(names) != 1:
             raise ValueError(f"{path}: expected exactly one demo group, found {names}")
         g = f["data"][names[0]]
         t = len(g["actions"])
-        for key in STATE_KEYS + (IMAGE_KEY,):
+        for key in tuple(state_keys) + (IMAGE_KEY,):
             if key not in g["obs"]:
                 raise KeyError(
                     f'{path}: missing obs/{key}; available: {list(g["obs"].keys())}'
@@ -140,19 +184,29 @@ def read_demo_info(path):
             )
         if g["obs"][IMAGE_KEY].shape[1:] != (128, 128, 3):
             raise ValueError(f"{path}: expected 128x128 RGB images")
-        state_dim = sum(g["obs"][k].shape[1] for k in STATE_KEYS)
+        state_dim = sum(g["obs"][k].shape[1] for k in state_keys)
         return t, state_dim
 
 
 class EpisodeDataset(Dataset):
-    def __init__(self, paths, state_mean, state_std, xyz_mean, xyz_std):
+    def __init__(
+        self, paths, state_mean, state_std, xyz_mean, xyz_std,
+        rotation_mean=None, rotation_std=None, state_keys=STATE_KEYS,
+    ):
         self.paths = [str(p) for p in paths]
-        self.lengths = [read_demo_info(p)[0] for p in self.paths]
+        self.state_keys = tuple(state_keys)
+        self.lengths = [read_demo_info(p, self.state_keys)[0] for p in self.paths]
         self.ends = np.cumsum(self.lengths).tolist()
         self.state_mean = torch.tensor(state_mean, dtype=torch.float32)
         self.state_std = torch.tensor(state_std, dtype=torch.float32)
-        self.xyz_mean = torch.tensor(xyz_mean, dtype=torch.float32)
-        self.xyz_std = torch.tensor(xyz_std, dtype=torch.float32)
+        self.motion_mean = torch.tensor(
+            list(xyz_mean) + ([] if rotation_mean is None else list(rotation_mean)),
+            dtype=torch.float32,
+        )
+        self.motion_std = torch.tensor(
+            list(xyz_std) + ([] if rotation_std is None else list(rotation_std)),
+            dtype=torch.float32,
+        )
         self.handles = {}
 
     def __len__(self):
@@ -173,14 +227,16 @@ class EpisodeDataset(Dataset):
             .float()
             / 255.0
         )
-        state = np.concatenate([g["obs"][key][i] for key in STATE_KEYS]).astype(
+        state = np.concatenate([g["obs"][key][i] for key in self.state_keys]).astype(
             np.float32
         )
         state = (torch.from_numpy(state) - self.state_mean) / self.state_std
         action = np.asarray(g["actions"][i], dtype=np.float32)
-        xyz = (torch.from_numpy(action[:3].copy()) - self.xyz_mean) / self.xyz_std
+        motion = (
+            torch.from_numpy(action[: len(self.motion_mean)].copy()) - self.motion_mean
+        ) / self.motion_std
         gripper = torch.tensor([float(action[6] > 0)], dtype=torch.float32)
-        return image, state, xyz, gripper
+        return image, state, motion, gripper
 
     def __del__(self):
         for f in getattr(self, "handles", {}).values():
@@ -190,21 +246,22 @@ class EpisodeDataset(Dataset):
                 pass
 
 
-def compute_stats(paths):
+def compute_stats(paths, predict_orientation=False, state_keys=STATE_KEYS):
     state_sum = state_sq = xyz_sum = xyz_sq = None
+    motion_dim = 6 if predict_orientation else 3
     count = 0
     for path in paths:
         with h5py.File(path, "r") as f:
             g = f["data"][next(iter(f["data"].keys()))]
             state = np.concatenate(
-                [g["obs"][key][:] for key in STATE_KEYS], axis=1
+                [g["obs"][key][:] for key in state_keys], axis=1
             ).astype(np.float64)
-            xyz = g["actions"][:, :3].astype(np.float64)
+            xyz = g["actions"][:, :motion_dim].astype(np.float64)
             if state_sum is None:
                 state_sum = np.zeros(state.shape[1])
                 state_sq = np.zeros(state.shape[1])
-                xyz_sum = np.zeros(3)
-                xyz_sq = np.zeros(3)
+                xyz_sum = np.zeros(motion_dim)
+                xyz_sq = np.zeros(motion_dim)
             state_sum += state.sum(0)
             state_sq += (state**2).sum(0)
             xyz_sum += xyz.sum(0)
@@ -214,17 +271,22 @@ def compute_stats(paths):
     ss = np.maximum(np.sqrt(np.maximum(state_sq / count - sm**2, 0)), 1e-3)
     xm = xyz_sum / count
     xs = np.maximum(np.sqrt(np.maximum(xyz_sq / count - xm**2, 0)), 1e-2)
-    return dict(
+    stats = dict(
         state_mean=sm.tolist(),
         state_std=ss.tolist(),
-        xyz_mean=xm.tolist(),
-        xyz_std=xs.tolist(),
+        xyz_mean=xm[:3].tolist(),
+        xyz_std=xs[:3].tolist(),
     )
+    if predict_orientation:
+        stats.update(rotation_mean=xm[3:].tolist(), rotation_std=xs[3:].tolist())
+    return stats
 
 
 class BCPolicy(nn.Module):
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, predict_orientation=False):
         super().__init__()
+        self.predict_orientation = bool(predict_orientation)
+        self.motion_dim = 6 if self.predict_orientation else 3
         self.vision = nn.Sequential(
             nn.Conv2d(3, 32, 5, stride=2, padding=2),
             nn.ReLU(),
@@ -244,29 +306,33 @@ class BCPolicy(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 4),
+            nn.Linear(128, self.motion_dim + 1),
         )
 
     def forward(self, image, state):
         out = self.head(torch.cat([self.vision(image), state], dim=1))
-        return out[:, :3], out[:, 3:4]
+        return out[:, : self.motion_dim], out[:, self.motion_dim :]
 
 
 def epoch_pass(model, loader, device, optimizer=None):
     training = optimizer is not None
     model.train(training)
-    total_loss = total_xyz = total_grip = n = 0
-    for image, state, xyz, gripper in loader:
-        image, state, xyz, gripper = [
-            x.to(device) for x in (image, state, xyz, gripper)
+    total_loss = total_xyz = total_grip = total_rotation = n = 0
+    for image, state, motion, gripper in loader:
+        image, state, motion, gripper = [
+            x.to(device) for x in (image, state, motion, gripper)
         ]
         with torch.set_grad_enabled(training):
-            pred_xyz, grip_logit = model(image, state)
-            xyz_loss = nn.functional.mse_loss(pred_xyz, xyz)
+            pred_motion, grip_logit = model(image, state)
+            xyz_loss = nn.functional.mse_loss(pred_motion[:, :3], motion[:, :3])
+            rotation_loss = (
+                nn.functional.mse_loss(pred_motion[:, 3:6], motion[:, 3:6])
+                if model.predict_orientation else pred_motion.new_zeros(())
+            )
             grip_loss = nn.functional.binary_cross_entropy_with_logits(
                 grip_logit, gripper
             )
-            loss = xyz_loss + 0.2 * grip_loss
+            loss = xyz_loss + rotation_loss + 0.2 * grip_loss
             if training:
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -275,8 +341,9 @@ def epoch_pass(model, loader, device, optimizer=None):
         total_loss += loss.item() * b
         total_xyz += xyz_loss.item() * b
         total_grip += grip_loss.item() * b
+        total_rotation += rotation_loss.item() * b
         n += b
-    return total_loss / n, total_xyz / n, total_grip / n
+    return total_loss / n, total_xyz / n, total_grip / n, total_rotation / n
 
 
 def train(args):
@@ -286,15 +353,17 @@ def train(args):
         raise RuntimeError(
             f"Need at least two per-episode HDF5 files in {args.dataset}"
         )
+    predict_orientation, environment_config = read_dataset_config(paths)
+    state_keys = STATE_KEYS + (("robot0_eef_quat",) if predict_orientation else ())
     random.Random(args.seed).shuffle(paths)
     n_val = max(1, round(len(paths) * args.val_fraction))
     val_paths, train_paths = paths[:n_val], paths[n_val:]
-    state_dims = {read_demo_info(p)[1] for p in paths}
+    state_dims = {read_demo_info(p, state_keys)[1] for p in paths}
     if len(state_dims) != 1:
         raise RuntimeError(f"Inconsistent state dimensions: {state_dims}")
-    stats = compute_stats(train_paths)
-    train_set = EpisodeDataset(train_paths, **stats)
-    val_set = EpisodeDataset(val_paths, **stats)
+    stats = compute_stats(train_paths, predict_orientation, state_keys)
+    train_set = EpisodeDataset(train_paths, state_keys=state_keys, **stats)
+    val_set = EpisodeDataset(val_paths, state_keys=state_keys, **stats)
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
@@ -304,7 +373,7 @@ def train(args):
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
-    model = BCPolicy(state_dims.pop()).to(device)
+    model = BCPolicy(state_dims.pop(), predict_orientation=predict_orientation).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
@@ -333,7 +402,9 @@ def train(args):
             "seed": args.seed,
             "val_fraction": args.val_fraction,
             "image_key": IMAGE_KEY,
-            "state_keys": list(STATE_KEYS),
+            "state_keys": list(state_keys),
+            "predict_orientation": predict_orientation,
+            "environment_config": environment_config,
             "action_dim": 7,
             "device": str(device),
         },
@@ -342,6 +413,7 @@ def train(args):
         print(f"W&B dashboard: {run.url}", flush=True)
         log_training_camera_samples(run, val_paths)
     best = float("inf")
+    print(f"Orientation actions: {predict_orientation} | State keys: {state_keys}", flush=True)
     print(
         f"Train: {len(train_paths)} episodes/{len(train_set)} transitions | "
         f"Validation: {len(val_paths)} episodes/{len(val_set)} transitions | Device: {device}",
@@ -361,14 +433,17 @@ def train(args):
                         "state_dim": len(stats["state_mean"]),
                         "epoch": epoch,
                         "best_val_loss": best,
-                        "state_keys": STATE_KEYS,
+                        "state_keys": state_keys,
                         "image_key": IMAGE_KEY,
+                        "predict_orientation": predict_orientation,
+                        "environment_config": environment_config,
                     },
                     output / "bc_best.pt",
                 )
             print(
                 f"Epoch {epoch:03d}/{args.epochs}: train={tr[0]:.5f} "
-                f"val={va[0]:.5f} (xyz={va[1]:.5f}, gripper={va[2]:.5f}) "
+                f"val={va[0]:.5f} (xyz={va[1]:.5f}, rotation={va[3]:.5f}, "
+                f"gripper={va[2]:.5f}) "
                 f"best={best:.5f}",
                 flush=True,
             )
@@ -378,9 +453,11 @@ def train(args):
                         "epoch": epoch,
                         "train/loss": tr[0],
                         "train/xyz_mse": tr[1],
+                        "train/rotation_mse": tr[3],
                         "train/gripper_bce": tr[2],
                         "val/loss": va[0],
                         "val/xyz_mse": va[1],
+                        "val/rotation_mse": va[3],
                         "val/gripper_bce": va[2],
                         "val/best_loss": best,
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
@@ -419,14 +496,18 @@ def evaluate(args):
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    model = BCPolicy(checkpoint["state_dim"]).to(device)
+    model = BCPolicy(
+        checkpoint["state_dim"],
+        predict_orientation=checkpoint.get("predict_orientation", False),
+    ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     stats = checkpoint["stats"]
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
-    xyz_mean = np.asarray(stats["xyz_mean"], dtype=np.float32)
-    xyz_std = np.asarray(stats["xyz_std"], dtype=np.float32)
+    state_keys = tuple(checkpoint.get("state_keys", STATE_KEYS))
+    image_key = checkpoint.get("image_key", IMAGE_KEY)
+    environment_config = checkpoint_environment_config(checkpoint)
     lift_threshold = float(collector.LIFT_HEIGHT - collector.LIFT_TOLERANCE)
     hold_steps = int(collector.LIFT_HOLD_STEPS)
     freq = int(collector.CONTROL_FREQ)
@@ -449,6 +530,8 @@ def evaluate(args):
             "lift_hold_steps": hold_steps,
             "live_render": args.render,
             "collector_module": args.collector_module,
+            "predict_orientation": model.predict_orientation,
+            "environment_config": environment_config,
             "stagnation_window": args.stagnation_window,
             "stationary_threshold_m": args.stationary_threshold,
             "small_action_threshold": args.small_action_threshold,
@@ -468,7 +551,7 @@ def evaluate(args):
         collector.REALTIME_RENDER = False
         for seed_index, seed in enumerate(seeds, start=1):
             seed_all(seed)
-            env = collector.create_env()
+            env = collector.create_env(**environment_config)
             try:
                 if hasattr(env, "rng"):
                     rng = env.rng
@@ -526,7 +609,7 @@ def evaluate(args):
                     for step in range(args.max_steps):
                         if capture and step % args.video_stride == 0:
                             robot_frames.append(
-                                np.flipud(np.asarray(obs[IMAGE_KEY])).copy()
+                                np.flipud(np.asarray(obs[image_key])).copy()
                             )
                             third_frames.append(
                                 render_third_person(env, third_camera, args.video_size)
@@ -537,20 +620,20 @@ def evaluate(args):
                             and (ep == 1 or seed_index == 1 and ep == 1)
                         ):
                             episode_images["start"] = np.flipud(
-                                np.asarray(obs[IMAGE_KEY])
+                                np.asarray(obs[image_key])
                             ).copy()
                         prev_eef = np.asarray(
                             obs["robot0_eef_pos"], dtype=np.float64
                         ).copy()
                         image = (
-                            torch.from_numpy(np.asarray(obs[IMAGE_KEY]).copy())
+                            torch.from_numpy(np.asarray(obs[image_key]).copy())
                             .permute(2, 0, 1)
                             .unsqueeze(0)
                             .float()
                             .to(device)
                             / 255.0
                         )
-                        state = np.concatenate([obs[k] for k in STATE_KEYS]).astype(
+                        state = np.concatenate([obs[k] for k in state_keys]).astype(
                             np.float32
                         )
                         state = (
@@ -559,10 +642,10 @@ def evaluate(args):
                             .to(device)
                         )
                         with torch.no_grad():
-                            pred_xyz, grip_logit = model(image, state)
-                        action = np.zeros(7, dtype=np.float32)
-                        action[:3] = pred_xyz[0].cpu().numpy() * xyz_std + xyz_mean
-                        action[6] = 1.0 if grip_logit.item() > 0 else -1.0
+                            pred_motion, grip_logit = model(image, state)
+                        action = action_from_prediction(
+                            pred_motion[0].cpu().numpy(), grip_logit.item(), stats
+                        )
                         action = np.clip(action, low, high)
                         last_action_norm = float(np.linalg.norm(action[:3]))
                         last_gripper = float(action[6])
@@ -589,7 +672,7 @@ def evaluate(args):
                                 stagnation_observed = True
                                 if "stagnation" not in episode_images and media_enabled:
                                     episode_images["stagnation"] = np.flipud(
-                                        np.asarray(obs[IMAGE_KEY])
+                                        np.asarray(obs[image_key])
                                     ).copy()
                         if args.render:
                             env.render()
@@ -665,7 +748,7 @@ def evaluate(args):
                                 not success and "failure" not in episode_images
                             ):
                                 episode_images["final"] = np.flipud(
-                                    np.asarray(obs[IMAGE_KEY])
+                                    np.asarray(obs[image_key])
                                 ).copy()
                                 for label, frame in episode_images.items():
                                     metrics[f"eval/images/{label}"] = wandb.Image(
@@ -736,6 +819,8 @@ def evaluate(args):
         summary = {
             "algorithm": "BC",
             "checkpoint": str(args.checkpoint),
+            "predict_orientation": model.predict_orientation,
+            "environment_config": environment_config,
             "seeds": seeds,
             "episodes_per_seed": args.episodes,
             "total_episodes": len(episode_rows),
