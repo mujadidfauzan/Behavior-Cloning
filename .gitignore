@@ -17,3 +17,6 @@ runs/
 *.log
 .DS_Store
 EOF
+
+reports/
+checkpoints*/

@@ -28,6 +28,7 @@ from cube_placement import (
     MinimumDistanceSampler,
     object_rotation_range,
 )
+from camera_quality import suspicious_frames
 from expert_orientation import grasp_orientation, orientation_command, orientation_distance
 
 
@@ -39,7 +40,8 @@ class ObjectRotationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def write_demo(self, mode, name="demo_00000.hdf5", legacy=False):
+    def write_demo(self, mode, name="demo_00000.hdf5", legacy=False,
+                   eye_in_hand=False):
         path = self.directory / name
         rng = np.random.default_rng(123)
         length = 6
@@ -52,12 +54,17 @@ class ObjectRotationTests(unittest.TestCase):
                 file.attrs["control_orientation"] = mode
                 file.attrs["random_object_rotation"] = mode
                 file.attrs["object_yaw_range_deg"] = 45.0 if mode else 0.0
+                file.attrs["use_eye_in_hand"] = eye_in_hand
             demo = file.create_group("data/demo_00000")
             demo.create_dataset("actions", data=actions)
             obs = demo.create_group("obs")
-            obs.create_dataset("agentview_image", data=rng.integers(
-                0, 256, (length, 128, 128, 3), dtype=np.uint8,
-            ))
+            agent_image = np.full((length, 128, 128, 3), 180, dtype=np.uint8)
+            agent_image[:, 50:70, 50:70] = [220, 20, 20]
+            obs.create_dataset("agentview_image", data=agent_image)
+            if eye_in_hand:
+                eye_image = np.full((length, 128, 128, 3), 200, dtype=np.uint8)
+                eye_image[:, 48:72, 48:72] = [220, 20, 20]
+                obs.create_dataset("robot0_eye_in_hand_image", data=eye_image)
             for key, size in (("robot0_joint_pos", 7), ("robot0_eef_pos", 3),
                               ("robot0_gripper_qpos", 2)):
                 obs.create_dataset(key, data=rng.normal(size=(length, size)))
@@ -218,7 +225,52 @@ class ObjectRotationTests(unittest.TestCase):
                 patch.object(collector, "RENDER", collector.RENDER):
             collector.main()
             self.assertEqual(collector.OUTPUT_DIR, output)
-            collect.assert_called_once_with(True, 30.0, num_demos=2, max_attempts=collector.MAX_ATTEMPTS)
+            collect.assert_called_once_with(True, 30.0, num_demos=2,
+                                            max_attempts=collector.MAX_ATTEMPTS,
+                                            use_eye_in_hand=False)
+
+    def test_two_camera_dataset_and_checkpoint(self):
+        path, _ = self.write_demo(True, eye_in_hand=True)
+        mode, environment = bc.read_dataset_config([path])
+        self.assertTrue(mode)
+        self.assertTrue(environment["use_eye_in_hand"])
+        keys = (bc.IMAGE_KEY, bc.EYE_IN_HAND_KEY)
+        state_keys = bc.STATE_KEYS + ("robot0_eef_quat",)
+        stats = bc.compute_stats([path], mode, state_keys)
+        dataset = bc.EpisodeDataset([path], state_keys=state_keys,
+                                    image_keys=keys, **stats)
+        try:
+            image, state, motion, grip = dataset[0]
+            self.assertEqual(tuple(image.shape), (6, 128, 128))
+            self.assertFalse(torch.equal(image[:3], image[3:]))
+            model = bc.BCPolicy(len(state), predict_orientation=True,
+                                num_cameras=2)
+            predicted, logit = model(image.unsqueeze(0), state.unsqueeze(0))
+            self.assertEqual(tuple(predicted.shape), (1, 6))
+            self.assertEqual(tuple(logit.shape), (1, 1))
+            restored = bc.BCPolicy(len(state), predict_orientation=True,
+                                   num_cameras=2)
+            restored.load_state_dict(model.state_dict())
+            self.assertEqual(bc.image_keys_from_checkpoint({"image_keys": keys}), keys)
+            with self.assertRaises(KeyError):
+                bc.read_demo_info(path, state_keys, (bc.IMAGE_KEY, "missing_image"))
+        finally:
+            dataset.__del__()
+        with h5py.File(path, "r+") as file:
+            file["data/demo_00000/obs/robot0_eye_in_hand_image"][3] = 0
+        with self.assertRaisesRegex(ValueError, "corrupted"):
+            bc.read_demo_info(path, state_keys, keys)
+
+    def test_camera_quality_rejects_corrupt_frames(self):
+        good = np.full((3, 128, 128, 3), 180, dtype=np.uint8)
+        good[:, 50:70, 50:70] = [220, 20, 20]
+        self.assertEqual(len(suspicious_frames(good)), 0)
+        bad = good.copy()
+        bad[1] = 0
+        bad[2] = np.random.default_rng(5).integers(
+            0, 256, (128, 128, 3), dtype=np.uint8
+        )
+        np.testing.assert_array_equal(suspicious_frames(bad), [1, 2])
 
     def test_success_recorder_restores_and_executes_rotation(self):
         # Exercise inference without requiring an MP4 backend; encoding is unrelated
@@ -292,6 +344,73 @@ class ObjectRotationTests(unittest.TestCase):
         self.assertEqual(len(actions), collector.LIFT_HOLD_STEPS)
         np.testing.assert_allclose(np.asarray(actions)[:, 3:6], np.tile([0.1, 0.2, 0.3], (len(actions), 1)))
         self.assertTrue(json.loads((output / "summary.json").read_text())["predict_orientation"])
+
+    def test_evaluation_records_success_and_failure_locally(self):
+        model = bc.BCPolicy(12)
+        checkpoint = self.directory / "policy.pt"
+        torch.save({
+            "model": model.state_dict(), "state_dim": 12,
+            "stats": {"state_mean": [0.] * 12, "state_std": [1.] * 12,
+                      "xyz_mean": [0.] * 3, "xyz_std": [1.] * 3},
+            "environment_config": {"random_object_rotation": False,
+                                   "object_yaw_range_deg": 45.0},
+        }, checkpoint)
+        episodes = [0]
+
+        def observation(lift=0.0):
+            return {"agentview_image": np.zeros((128, 128, 3), dtype=np.uint8),
+                    "robot0_joint_pos": np.zeros(7), "robot0_eef_pos": np.zeros(3),
+                    "robot0_gripper_qpos": np.zeros(2),
+                    "cube_pos": np.array([0., 0., 0.82 + lift])}
+
+        def reset():
+            episodes[0] += 1
+            return observation()
+
+        def step(action):
+            return observation(0.2 if episodes[0] == 1 else 0.0), 0, False, {}
+
+        environment = SimpleNamespace(
+            reset=reset, step=step, close=lambda: None,
+            action_spec=(-np.ones(7), np.ones(7)), _check_success=lambda: True,
+        )
+
+        class Writer:
+            def __init__(self, path, **kwargs):
+                self.path = Path(path)
+                self.frames = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.path.write_bytes(bytes([self.frames]))
+
+            def append_data(self, frame):
+                self.frames += 1
+
+        imageio = ModuleType("imageio")
+        imageio.v2 = ModuleType("imageio.v2")
+        imageio.v2.get_writer = Writer
+        modules = {"imageio": imageio, "imageio.v2": imageio.v2,
+                   "imageio_ffmpeg": ModuleType("imageio_ffmpeg")}
+        output = self.directory / "evaluation"
+        argv = ["bc_baseline.py", "eval", "--checkpoint", str(checkpoint),
+                "--episodes", "2", "--num-seeds", "1", "--max-steps", "20",
+                "--diagnostic-interval", "0", "--record-videos",
+                "--video-episodes", "2", "--video-stride", "2",
+                "--eval-output", str(output), "--cpu"]
+        with patch.dict("sys.modules", modules), patch("sys.argv", argv), \
+                patch.object(collector, "create_env", return_value=environment), \
+                patch.object(bc, "choose_third_person_camera", return_value="frontview"), \
+                patch.object(bc, "render_third_person", return_value=np.zeros((128, 128, 3), dtype=np.uint8)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bc.main()
+        summary = json.loads((output / "bc_eval_summary.json").read_text())
+        self.assertEqual(summary["total_episodes"], 2)
+        self.assertEqual(summary["total_successes"], 1)
+        self.assertEqual(summary["local_videos_recorded"], 2)
+        self.assertEqual(len(list((output / "videos").glob("*.mp4"))), 4)
 
 
 if __name__ == "__main__":

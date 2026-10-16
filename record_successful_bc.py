@@ -59,9 +59,11 @@ def main():
         "cpu" if args.cpu or not torch.cuda.is_available() else "cuda"
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    image_keys = bc.image_keys_from_checkpoint(checkpoint)
     model = bc.BCPolicy(
         checkpoint["state_dim"],
         predict_orientation=checkpoint.get("predict_orientation", False),
+        num_cameras=len(image_keys),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -69,7 +71,7 @@ def main():
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
     environment_config = bc.checkpoint_environment_config(checkpoint)
-    image_key = checkpoint.get("image_key", "agentview_image")
+    image_key = image_keys[0]
     state_keys = tuple(
         checkpoint.get(
             "state_keys", ("robot0_joint_pos", "robot0_eef_pos", "robot0_gripper_qpos")
@@ -139,14 +141,9 @@ def main():
                                 tw.append_data(
                                     bc.render_third_person(env, camera, args.video_size)
                                 )
-                            image = (
-                                torch.from_numpy(np.asarray(obs[image_key]).copy())
-                                .permute(2, 0, 1)
-                                .unsqueeze(0)
-                                .float()
-                                .to(device)
-                                / 255.0
-                            )
+                            image = bc.image_from_observation(
+                                obs, image_keys
+                            ).unsqueeze(0).to(device)
                             state = np.concatenate([obs[k] for k in state_keys]).astype(
                                 np.float32
                             )

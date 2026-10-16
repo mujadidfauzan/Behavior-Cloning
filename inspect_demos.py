@@ -7,6 +7,7 @@ from pathlib import Path
 import h5py
 import matplotlib
 import numpy as np
+from camera_quality import suspicious_frames
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -74,12 +75,18 @@ def inspect_demo(group, name, file, threshold):
                         f"Unexpected camera format: {group_name}/{key} {ds.shape} {ds.dtype}"
                     )
                 if t and ds.ndim == 4:
-                    for idx in sorted({0, t // 2, t - 1}):
+                    indices = sorted({0, t // 2, t - 1})
+                    frames = []
+                    for idx in indices:
                         frame = ds[idx]
+                        frames.append(frame)
                         if not np.isfinite(frame).all() or np.ptp(frame) == 0:
                             problems.append(
                                 f"Invalid or constant camera frame: {key}[{idx}]"
                             )
+                    if ds.shape[-1] == 3:
+                        for bad in suspicious_frames(np.stack(frames)):
+                            problems.append(f"Corrupted camera frame: {key}[{indices[bad]}]")
     if not any(k.startswith("obs/") for k in camera):
         problems.append("No camera images in obs")
     final_lift = max_lift = float("nan")

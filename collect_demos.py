@@ -5,6 +5,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import robosuite as suite
+from camera_quality import suspicious_frames
 from robosuite.controllers import load_composite_controller_config
 from robosuite.environments.manipulation.lift import Lift
 from robosuite.models.arenas import TableArena
@@ -45,6 +46,7 @@ REALTIME_RENDER = False
 
 # Camera observations
 CAMERA_NAMES = ["agentview"]
+EYE_IN_HAND_CAMERA = "robot0_eye_in_hand"
 IMAGE_HEIGHT = 128
 IMAGE_WIDTH = 128
 
@@ -192,6 +194,7 @@ class ThreeCubeLift(Lift):
 def create_env(
     random_object_rotation=False,
     object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+    use_eye_in_hand=False,
 ):
 
     controller = load_composite_controller_config(
@@ -221,7 +224,7 @@ def create_env(
         has_renderer=RENDER,
         has_offscreen_renderer=True,
         use_camera_obs=True,
-        camera_names=CAMERA_NAMES,
+        camera_names=CAMERA_NAMES + ([EYE_IN_HAND_CAMERA] if use_eye_in_hand else []),
         camera_heights=IMAGE_HEIGHT,
         camera_widths=IMAGE_WIDTH,
         camera_depths=False,
@@ -234,6 +237,8 @@ def create_env(
 
     if env.action_dim != 7:
         raise RuntimeError(f"Expected 7D action, got {env.action_dim}")
+
+    env.use_eye_in_hand = bool(use_eye_in_hand)
 
     return env
 
@@ -600,6 +605,7 @@ def save_episode_file(demo_id, result, env):
         h5file.attrs["object_yaw_range_deg"] = (
             env.object_yaw_range_deg if env.random_object_rotation else 0.0
         )
+        h5file.attrs["use_eye_in_hand"] = getattr(env, "use_eye_in_hand", False)
         h5file.attrs["target_lift_m"] = LIFT_HEIGHT
         h5file.attrs["lift_tolerance_m"] = LIFT_TOLERANCE
         h5file.attrs["image_height"] = IMAGE_HEIGHT
@@ -620,6 +626,7 @@ def collect(
     object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
     num_demos=None,
     max_attempts=None,
+    use_eye_in_hand=False,
 ):
     num_demos = NUM_DEMOS if num_demos is None else num_demos
     max_attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
@@ -638,6 +645,8 @@ def collect(
                 file.attrs.get("object_yaw_range_deg", np.nan), object_yaw_range_deg
             ):
                 raise ValueError(f"{path}: object yaw range differs from this collection")
+            if bool(file.attrs.get("use_eye_in_hand", False)) != use_eye_in_hand:
+                raise ValueError(f"{path}: camera mode differs; choose a separate --output directory")
 
     existing_ids = existing_demo_ids()
     saved = len(existing_ids)
@@ -654,7 +663,7 @@ def collect(
     print(f"Existing files:        {saved}")
     print(f"Next demo ID:          {next_id:05d}")
     print(f"Maximum new attempts:  {max_attempts}")
-    print(f"Camera:                {CAMERA_NAMES}")
+    print(f"Camera:                {CAMERA_NAMES + ([EYE_IN_HAND_CAMERA] if use_eye_in_hand else [])}")
     print(f"Image resolution:      {IMAGE_WIDTH}x{IMAGE_HEIGHT}")
     print(f"Control frequency:     {CONTROL_FREQ} Hz")
     print(f"Cube placement X/Y:    {CUBE_X_RANGE} / {CUBE_Y_RANGE} m")
@@ -671,7 +680,8 @@ def collect(
         print("Target already reached. No new episodes needed.")
         return
 
-    env = create_env(random_object_rotation, object_yaw_range_deg)
+    env = create_env(random_object_rotation, object_yaw_range_deg,
+                     use_eye_in_hand=use_eye_in_hand)
     attempts = 0
     new_saved = 0
     total_steps = 0
@@ -684,6 +694,16 @@ def collect(
             result = run_episode(env)
 
             if result["success"]:
+                bad_cameras = []
+                for key, frames in result["observations"].items():
+                    if key.endswith("_image"):
+                        bad = suspicious_frames(frames)
+                        if len(bad):
+                            bad_cameras.append(f"{key}: {len(bad)} bad frames (first step {bad[0]})")
+                if bad_cameras:
+                    print(f"[{attempts:04d}] REJECTED | Camera corruption: "
+                          + "; ".join(bad_cameras), flush=True)
+                    continue
                 while (OUTPUT_DIR / f"demo_{next_id:05d}.hdf5").exists():
                     next_id += 1
                 path = save_episode_file(next_id, result, env)
@@ -732,6 +752,8 @@ def main():
     parser = argparse.ArgumentParser(description="Collect successful three-cube Lift demos")
     parser.add_argument("--random-object-rotation", action="store_true",
                         help="Randomize object yaw and control gripper orientation")
+    parser.add_argument("--eye-in-hand", action="store_true",
+                        help="Record robot0_eye_in_hand_image alongside agentview_image")
     parser.add_argument("--object-yaw-range-deg", type=float,
                         default=DEFAULT_OBJECT_YAW_RANGE_DEG,
                         help="Symmetric object yaw range in degrees (default: +/-45)")
@@ -752,9 +774,12 @@ def main():
         OUTPUT_DIR = args.output
     elif args.random_object_rotation:
         OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_rotation")
+    if args.eye_in_hand and args.output is None:
+        OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_eye_in_hand")
     RENDER = args.render
     collect(args.random_object_rotation, args.object_yaw_range_deg,
-            num_demos=args.num_demos, max_attempts=args.max_attempts)
+            num_demos=args.num_demos, max_attempts=args.max_attempts,
+            use_eye_in_hand=args.eye_in_hand)
 
 
 if __name__ == "__main__":

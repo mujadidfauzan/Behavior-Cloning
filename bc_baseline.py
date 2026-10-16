@@ -10,6 +10,7 @@ and restored from the checkpoint during evaluation.
 
 import argparse
 import bisect
+import copy
 import csv
 import json
 import random
@@ -21,6 +22,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from camera_quality import suspicious_frames
 
 
 def init_wandb(args, job_type, config):
@@ -43,7 +45,7 @@ def init_wandb(args, job_type, config):
     return run
 
 
-def log_training_camera_samples(run, paths, max_images=6):
+def log_training_camera_samples(run, paths, max_images=6, image_keys=("agentview_image",)):
     """Show held-out demonstration camera frames on the training dashboard."""
     if run is None:
         return
@@ -53,13 +55,14 @@ def log_training_camera_samples(run, paths, max_images=6):
     for path in paths[:max_images]:
         with h5py.File(path, "r") as f:
             demo = f["data"][next(iter(f["data"]))]
-            images = demo["obs"][IMAGE_KEY]
-            index = len(images) // 2
-            # Robosuite camera observations are vertically flipped for display.
-            rgb = np.flipud(np.asarray(images[index])).copy()
-            samples.append(
-                wandb.Image(rgb, caption=f"{path.stem} | step {index} | validation")
-            )
+            for key in image_keys:
+                images = demo["obs"][key]
+                index = len(images) // 2
+                # Robosuite camera observations are vertically flipped for display.
+                rgb = np.flipud(np.asarray(images[index])).copy()
+                samples.append(
+                    wandb.Image(rgb, caption=f"{path.stem} | {key} | step {index} | validation")
+                )
     if samples:
         run.log({"data/validation_robot_camera": samples})
 
@@ -111,7 +114,20 @@ def log_episode_videos(run, ep, robot_frames, third_frames, third_camera, fps):
 
 
 IMAGE_KEY = "agentview_image"
+EYE_IN_HAND_KEY = "robot0_eye_in_hand_image"
 STATE_KEYS = ("robot0_joint_pos", "robot0_eef_pos", "robot0_gripper_qpos")
+
+
+def image_keys_from_checkpoint(checkpoint):
+    return tuple(checkpoint.get("image_keys", (checkpoint.get("image_key", IMAGE_KEY),)))
+
+
+def image_from_observation(obs, image_keys):
+    """Stack normalized RGB cameras along channels in checkpoint order."""
+    return torch.cat([
+        torch.from_numpy(np.asarray(obs[key]).copy()).permute(2, 0, 1).float() / 255.0
+        for key in image_keys
+    ], dim=0)
 
 
 def read_dataset_config(paths):
@@ -123,15 +139,19 @@ def read_dataset_config(paths):
             # Earlier collectors randomized full yaw but commanded zero rotation.
             random_rotation = bool(file.attrs.get("random_object_rotation", True))
             yaw_range = float(file.attrs.get("object_yaw_range_deg", 180.0))
+            eye_in_hand = bool(file.attrs.get("use_eye_in_hand", False))
             configurations.add((control_orientation, random_rotation,
-                                yaw_range if random_rotation else 0.0))
+                                yaw_range if random_rotation else 0.0, eye_in_hand))
     if len(configurations) != 1:
         raise ValueError("Dataset mixes rotation configurations; train each dataset separately")
-    control_orientation, random_rotation, yaw_range = configurations.pop()
-    return control_orientation, {
+    control_orientation, random_rotation, yaw_range, eye_in_hand = configurations.pop()
+    environment = {
         "random_object_rotation": random_rotation,
         "object_yaw_range_deg": yaw_range if random_rotation else 45.0,
     }
+    if eye_in_hand:
+        environment["use_eye_in_hand"] = True
+    return control_orientation, environment
 
 
 def action_from_prediction(motion, grip_logit, stats):
@@ -164,14 +184,14 @@ def seed_all(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def read_demo_info(path, state_keys=STATE_KEYS):
+def read_demo_info(path, state_keys=STATE_KEYS, image_keys=(IMAGE_KEY,)):
     with h5py.File(path, "r") as f:
         names = sorted(f["data"].keys())
         if len(names) != 1:
             raise ValueError(f"{path}: expected exactly one demo group, found {names}")
         g = f["data"][names[0]]
         t = len(g["actions"])
-        for key in tuple(state_keys) + (IMAGE_KEY,):
+        for key in tuple(state_keys) + tuple(image_keys):
             if key not in g["obs"]:
                 raise KeyError(
                     f'{path}: missing obs/{key}; available: {list(g["obs"].keys())}'
@@ -182,8 +202,17 @@ def read_demo_info(path, state_keys=STATE_KEYS):
             raise ValueError(
                 f'{path}: expected actions (T,7), got {g["actions"].shape}'
             )
-        if g["obs"][IMAGE_KEY].shape[1:] != (128, 128, 3):
-            raise ValueError(f"{path}: expected 128x128 RGB images")
+        for key in image_keys:
+            if g["obs"][key].shape[1:] != (128, 128, 3):
+                raise ValueError(f"{path}: expected 128x128 RGB image for {key}")
+            if len(image_keys) == 2 and t:
+                sample_indices = np.linspace(0, t - 1, min(8, t), dtype=int)
+                frames = np.stack([g["obs"][key][int(i)] for i in sample_indices])
+                bad = suspicious_frames(frames)
+                if len(bad):
+                    raise ValueError(
+                        f"{path}: corrupted {key} frame near step {sample_indices[bad[0]]}"
+                    )
         state_dim = sum(g["obs"][k].shape[1] for k in state_keys)
         return t, state_dim
 
@@ -192,10 +221,13 @@ class EpisodeDataset(Dataset):
     def __init__(
         self, paths, state_mean, state_std, xyz_mean, xyz_std,
         rotation_mean=None, rotation_std=None, state_keys=STATE_KEYS,
+        image_keys=(IMAGE_KEY,),
     ):
         self.paths = [str(p) for p in paths]
         self.state_keys = tuple(state_keys)
-        self.lengths = [read_demo_info(p, self.state_keys)[0] for p in self.paths]
+        self.image_keys = tuple(image_keys)
+        self.lengths = [read_demo_info(p, self.state_keys, self.image_keys)[0]
+                        for p in self.paths]
         self.ends = np.cumsum(self.lengths).tolist()
         self.state_mean = torch.tensor(state_mean, dtype=torch.float32)
         self.state_std = torch.tensor(state_std, dtype=torch.float32)
@@ -221,11 +253,8 @@ class EpisodeDataset(Dataset):
         f = self.handles[path]
         g = f["data"][next(iter(f["data"].keys()))]
         i = index - offset
-        image = (
-            torch.from_numpy(np.asarray(g["obs"][IMAGE_KEY][i]).copy())
-            .permute(2, 0, 1)
-            .float()
-            / 255.0
+        image = image_from_observation(
+            {key: g["obs"][key][i] for key in self.image_keys}, self.image_keys
         )
         state = np.concatenate([g["obs"][key][i] for key in self.state_keys]).astype(
             np.float32
@@ -283,9 +312,12 @@ def compute_stats(paths, predict_orientation=False, state_keys=STATE_KEYS):
 
 
 class BCPolicy(nn.Module):
-    def __init__(self, state_dim, predict_orientation=False):
+    def __init__(self, state_dim, predict_orientation=False, num_cameras=1):
         super().__init__()
         self.predict_orientation = bool(predict_orientation)
+        if num_cameras not in (1, 2):
+            raise ValueError("BCPolicy supports one or two cameras")
+        self.num_cameras = num_cameras
         self.motion_dim = 6 if self.predict_orientation else 3
         self.vision = nn.Sequential(
             nn.Conv2d(3, 32, 5, stride=2, padding=2),
@@ -301,8 +333,10 @@ class BCPolicy(nn.Module):
             nn.Linear(128 * 4 * 4, 256),
             nn.ReLU(),
         )
+        if num_cameras == 2:
+            self.eye_vision = copy.deepcopy(self.vision)
         self.head = nn.Sequential(
-            nn.Linear(256 + state_dim, 256),
+            nn.Linear(256 * num_cameras + state_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU(),
@@ -310,7 +344,12 @@ class BCPolicy(nn.Module):
         )
 
     def forward(self, image, state):
-        out = self.head(torch.cat([self.vision(image), state], dim=1))
+        if image.shape[1] != 3 * self.num_cameras:
+            raise ValueError(f"Expected {3 * self.num_cameras} image channels")
+        visual = self.vision(image[:, :3])
+        if self.num_cameras == 2:
+            visual = torch.cat([visual, self.eye_vision(image[:, 3:])], dim=1)
+        out = self.head(torch.cat([visual, state], dim=1))
         return out[:, : self.motion_dim], out[:, self.motion_dim :]
 
 
@@ -355,6 +394,9 @@ def train(args):
         )
     predict_orientation, environment_config = read_dataset_config(paths)
     state_keys = STATE_KEYS + (("robot0_eef_quat",) if predict_orientation else ())
+    image_keys = (IMAGE_KEY, EYE_IN_HAND_KEY) if environment_config.get(
+        "use_eye_in_hand", False
+    ) else (IMAGE_KEY,)
     output = Path(args.output)
     if args.resume and output.resolve() != Path(args.resume).resolve().parent:
         raise ValueError("--output must be the directory containing --resume")
@@ -369,6 +411,8 @@ def train(args):
             raise ValueError("Checkpoint object rotation settings differ from dataset")
         if tuple(checkpoint.get("state_keys", STATE_KEYS)) != state_keys:
             raise ValueError("Checkpoint state keys differ from dataset")
+        if image_keys_from_checkpoint(checkpoint) != image_keys:
+            raise ValueError("Checkpoint camera inputs differ from dataset")
         split = checkpoint.get("split")
         if split is None:
             split_path = Path(args.resume).parent / "split.json"
@@ -389,7 +433,7 @@ def train(args):
         val_paths, train_paths = paths[:n_val], paths[n_val:]
         split = {"train": [p.name for p in train_paths],
                  "val": [p.name for p in val_paths]}
-    state_dims = {read_demo_info(p, state_keys)[1] for p in paths}
+    state_dims = {read_demo_info(p, state_keys, image_keys)[1] for p in paths}
     if len(state_dims) != 1:
         raise RuntimeError(f"Inconsistent state dimensions: {state_dims}")
     stats = checkpoint["stats"] if checkpoint is not None else compute_stats(
@@ -397,8 +441,10 @@ def train(args):
     )
     if len(stats["state_mean"]) != next(iter(state_dims)):
         raise ValueError("Checkpoint state dimension differs from dataset")
-    train_set = EpisodeDataset(train_paths, state_keys=state_keys, **stats)
-    val_set = EpisodeDataset(val_paths, state_keys=state_keys, **stats)
+    train_set = EpisodeDataset(train_paths, state_keys=state_keys,
+                               image_keys=image_keys, **stats)
+    val_set = EpisodeDataset(val_paths, state_keys=state_keys,
+                             image_keys=image_keys, **stats)
     train_loader = DataLoader(
         train_set, batch_size=args.batch_size, shuffle=True, num_workers=0
     )
@@ -408,7 +454,8 @@ def train(args):
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
-    model = BCPolicy(state_dims.pop(), predict_orientation=predict_orientation).to(device)
+    model = BCPolicy(state_dims.pop(), predict_orientation=predict_orientation,
+                     num_cameras=len(image_keys)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 1
     best = float("inf")
@@ -444,6 +491,7 @@ def train(args):
             "seed": args.seed,
             "val_fraction": args.val_fraction,
             "image_key": IMAGE_KEY,
+            "image_keys": list(image_keys),
             "state_keys": list(state_keys),
             "predict_orientation": predict_orientation,
             "environment_config": environment_config,
@@ -453,8 +501,8 @@ def train(args):
     )
     if run is not None:
         print(f"W&B dashboard: {run.url}", flush=True)
-        log_training_camera_samples(run, val_paths)
-    print(f"Orientation actions: {predict_orientation} | State keys: {state_keys}", flush=True)
+        log_training_camera_samples(run, val_paths, image_keys=image_keys)
+    print(f"Orientation actions: {predict_orientation} | Cameras: {image_keys} | State keys: {state_keys}", flush=True)
     if checkpoint is not None:
         print(f"Resuming from epoch {start_epoch - 1} to {args.epochs}", flush=True)
     print(
@@ -478,6 +526,7 @@ def train(args):
                 "best_val_loss": best,
                 "state_keys": state_keys,
                 "image_key": IMAGE_KEY,
+                "image_keys": image_keys,
                 "predict_orientation": predict_orientation,
                 "environment_config": environment_config,
                 "split": split,
@@ -543,9 +592,11 @@ def evaluate(args):
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    image_keys = image_keys_from_checkpoint(checkpoint)
     model = BCPolicy(
         checkpoint["state_dim"],
         predict_orientation=checkpoint.get("predict_orientation", False),
+        num_cameras=len(image_keys),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -553,7 +604,7 @@ def evaluate(args):
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
     state_keys = tuple(checkpoint.get("state_keys", STATE_KEYS))
-    image_key = checkpoint.get("image_key", IMAGE_KEY)
+    image_key = image_keys[0]
     environment_config = checkpoint_environment_config(checkpoint)
     lift_threshold = float(collector.LIFT_HEIGHT - collector.LIFT_TOLERANCE)
     hold_steps = int(collector.LIFT_HOLD_STEPS)
@@ -561,6 +612,18 @@ def evaluate(args):
     seeds = [args.seed + i * args.seed_step for i in range(args.num_seeds)]
     output = Path(args.eval_output)
     output.mkdir(parents=True, exist_ok=True)
+    local_video_enabled = getattr(args, "record_videos", False)
+    if local_video_enabled:
+        try:
+            import imageio.v2 as imageio
+            import imageio_ffmpeg  # noqa: F401 - ensure MP4 backend is installed
+        except ImportError as exc:
+            raise RuntimeError(
+                "Local MP4 recording requires: python -m pip install imageio imageio-ffmpeg"
+            ) from exc
+        video_dir = output / "videos"
+        video_dir.mkdir(exist_ok=True)
+    local_videos_recorded = 0
 
     run = init_wandb(
         args,
@@ -578,6 +641,7 @@ def evaluate(args):
             "live_render": args.render,
             "collector_module": args.collector_module,
             "predict_orientation": model.predict_orientation,
+            "image_keys": list(image_keys),
             "environment_config": environment_config,
             "stagnation_window": args.stagnation_window,
             "stationary_threshold_m": args.stationary_threshold,
@@ -620,7 +684,7 @@ def evaluate(args):
                 media_enabled = run is not None and args.log_videos
                 third_camera = (
                     choose_third_person_camera(env, args.third_person_camera)
-                    if media_enabled
+                    if media_enabled or local_video_enabled
                     else None
                 )
                 successes = 0
@@ -632,12 +696,17 @@ def evaluate(args):
                     obs = env.reset()
                     global_episode += 1
                     # Spread recordings across seeds, starting with episode 1 of each seed.
-                    capture = (
+                    capture_wandb = (
                         media_enabled
                         and videos_logged < args.video_episodes
                         and (ep == 1 or seed_index == len(seeds))
                     )
-                    robot_frames, third_frames = [], []
+                    capture_local = (
+                        local_video_enabled
+                        and local_videos_recorded < args.video_episodes
+                    )
+                    capture = capture_wandb or capture_local
+                    robot_frames, third_frames, eye_frames = [], [], []
                     initial_z = float(obs["cube_pos"][2])
                     held = 0
                     max_lift = 0.0
@@ -661,6 +730,10 @@ def evaluate(args):
                             third_frames.append(
                                 render_third_person(env, third_camera, args.video_size)
                             )
+                            if capture_local and EYE_IN_HAND_KEY in image_keys:
+                                eye_frames.append(
+                                    np.flipud(np.asarray(obs[EYE_IN_HAND_KEY])).copy()
+                                )
                         if (
                             media_enabled
                             and step == 0
@@ -672,14 +745,9 @@ def evaluate(args):
                         prev_eef = np.asarray(
                             obs["robot0_eef_pos"], dtype=np.float64
                         ).copy()
-                        image = (
-                            torch.from_numpy(np.asarray(obs[image_key]).copy())
-                            .permute(2, 0, 1)
-                            .unsqueeze(0)
-                            .float()
-                            .to(device)
-                            / 255.0
-                        )
+                        image = image_from_observation(
+                            obs, image_keys
+                        ).unsqueeze(0).to(device)
                         state = np.concatenate([obs[k] for k in state_keys]).astype(
                             np.float32
                         )
@@ -765,6 +833,22 @@ def evaluate(args):
                         "stagnation_observed": int(stagnation_observed),
                     }
                     episode_rows.append(row)
+                    if capture_local and robot_frames:
+                        fps = max(1, round(freq / args.video_stride))
+                        stem = f"seed_{seed}_episode_{ep:03d}_{termination}"
+                        recordings = [("agentview", robot_frames),
+                                      (third_camera, third_frames)]
+                        if eye_frames:
+                            recordings.append(("robot0_eye_in_hand", eye_frames))
+                        for name, frames in recordings:
+                            path = video_dir / f"{stem}_{name}.mp4"
+                            with imageio.get_writer(
+                                str(path), fps=fps, codec="libx264", macro_block_size=1
+                            ) as writer:
+                                for frame in frames:
+                                    writer.append_data(frame)
+                        local_videos_recorded += 1
+                        print(f"  Videos: {video_dir / stem}_*.mp4", flush=True)
                     if run is not None:
                         metrics = {
                             "eval/seed": seed,
@@ -803,7 +887,7 @@ def evaluate(args):
                                         caption=f"seed={seed} episode={ep} {label} "
                                         f"{termination} lift={max_lift:.3f}m",
                                     )
-                            if capture and robot_frames:
+                            if capture_wandb and robot_frames:
                                 try:
 
                                     def video(frames, caption):
@@ -867,12 +951,14 @@ def evaluate(args):
             "algorithm": "BC",
             "checkpoint": str(args.checkpoint),
             "predict_orientation": model.predict_orientation,
+            "image_keys": list(image_keys),
             "environment_config": environment_config,
             "seeds": seeds,
             "episodes_per_seed": args.episodes,
             "total_episodes": len(episode_rows),
             "total_successes": total_success,
             "overall_success_rate": total_success / len(episode_rows),
+            "local_videos_recorded": local_videos_recorded,
             "mean_seed_success_rate": mean_rate,
             "std_seed_success_rate_sample": std_rate,
             "seed_results": seed_rows,
@@ -992,6 +1078,10 @@ def main():
     e.add_argument("--cpu", action="store_true")
     e.add_argument(
         "--log-videos", action="store_true", help="Log both camera views to W&B"
+    )
+    e.add_argument(
+        "--record-videos", action="store_true",
+        help="Save agentview and third-person MP4s locally for the first --video-episodes rollouts",
     )
     e.add_argument(
         "--video-episodes",
