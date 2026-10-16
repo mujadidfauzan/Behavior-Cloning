@@ -1,0 +1,19 @@
+cat > .gitignore <<'EOF'
+# Large datasets
+datasets/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Local experiment tracking
+wandb/
+runs/
+
+# Temporary files
+*.log
+.DS_Store
+EOF
