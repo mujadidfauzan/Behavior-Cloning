@@ -77,9 +77,16 @@ class ThreeCubeLift(Lift):
 
     def __init__(
         self, *args, random_object_rotation=False,
-        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG, **kwargs,
+        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+        control_orientation=None, **kwargs,
     ):
         self.random_object_rotation = bool(random_object_rotation)
+        self.control_orientation = (
+            self.random_object_rotation if control_orientation is None
+            else bool(control_orientation)
+        )
+        if self.control_orientation and not self.random_object_rotation:
+            raise ValueError("Orientation control requires randomized object yaw")
         self.object_yaw_range_deg = float(object_yaw_range_deg)
         self.object_rotation = object_rotation_range(
             self.random_object_rotation, self.object_yaw_range_deg
@@ -181,13 +188,20 @@ class ThreeCubeLift(Lift):
 def create_env(
     random_object_rotation=False,
     object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+    control_orientation=None,
 ):
+    control_orientation = (
+        bool(random_object_rotation) if control_orientation is None
+        else bool(control_orientation)
+    )
+    if control_orientation and not random_object_rotation:
+        raise ValueError("Orientation control requires randomized object yaw")
     controller = load_composite_controller_config(controller="BASIC", robot="Panda")
     right = controller["body_parts"]["right"]
     right["type"] = "OSC_POSE"
     right["input_type"] = "delta"
     right["impedance_mode"] = "fixed"
-    if random_object_rotation:
+    if control_orientation:
         right["input_ref_frame"] = "world"
     controller["body_parts"] = {"right": right}
 
@@ -196,6 +210,7 @@ def create_env(
         controller_configs=controller,
         random_object_rotation=random_object_rotation,
         object_yaw_range_deg=object_yaw_range_deg,
+        control_orientation=control_orientation,
         initialization_noise={"magnitude": JOINT_NOISE_RAD, "type": "uniform"},
         renderer=RENDERER,
         render_camera=RENDER_CAMERA,
@@ -206,6 +221,7 @@ def create_env(
         control_freq=CONTROL_FREQ,
         horizon=MAX_STEPS,
         ignore_done=True,
+        hard_reset=False,
         reward_shaping=False,
     )
     if environment.action_dim != 7:
@@ -340,7 +356,7 @@ def run_episode(episode_id):
     initial_cube_pos = obs["cube_pos"].copy()
     initial_joint_pos = obs["robot0_joint_pos"].copy()
     target_orientation = (
-        grasp_orientation(obs) if env.random_object_rotation else None
+        grasp_orientation(obs) if env.control_orientation else None
     )
 
     initial_blue_pos, initial_green_pos = env.get_distractor_positions()
@@ -600,8 +616,11 @@ def evaluate():
 def main():
     global env, RENDER, NUM_EPISODES
     parser = argparse.ArgumentParser(description="Evaluate the three-cube scripted expert")
-    parser.add_argument("--random-object-rotation", action="store_true",
-                        help="Randomize object yaw and control gripper orientation")
+    yaw_mode = parser.add_mutually_exclusive_group()
+    yaw_mode.add_argument("--random-object-rotation", action="store_true",
+                          help="Randomize object yaw and control gripper orientation")
+    yaw_mode.add_argument("--random-object-yaw-only", action="store_true",
+                          help="Randomize object yaw while keeping gripper orientation fixed")
     parser.add_argument("--object-yaw-range-deg", type=float,
                         default=DEFAULT_OBJECT_YAW_RANGE_DEG,
                         help="Symmetric object yaw range in degrees (default: +/-45)")
@@ -610,17 +629,19 @@ def main():
     args = parser.parse_args()
     if args.episodes < 1:
         parser.error("--episodes must be positive")
+    random_yaw = args.random_object_rotation or args.random_object_yaw_only
     try:
-        object_rotation_range(args.random_object_rotation, args.object_yaw_range_deg)
+        object_rotation_range(random_yaw, args.object_yaw_range_deg)
     except ValueError as error:
         parser.error(str(error))
 
     RENDER = args.render
     NUM_EPISODES = args.episodes
-    print(f"Random object yaw / orientation actions: {args.random_object_rotation}")
-    if args.random_object_rotation:
+    print(f"Random object yaw: {random_yaw} | Orientation actions: {args.random_object_rotation}")
+    if random_yaw:
         print(f"Object yaw range: +/-{args.object_yaw_range_deg:g} degrees")
-    env = create_env(args.random_object_rotation, args.object_yaw_range_deg)
+    env = create_env(random_yaw, args.object_yaw_range_deg,
+                     control_orientation=args.random_object_rotation)
 
     try:
 

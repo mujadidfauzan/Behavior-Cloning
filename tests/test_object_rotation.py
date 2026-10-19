@@ -41,7 +41,7 @@ class ObjectRotationTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def write_demo(self, mode, name="demo_00000.hdf5", legacy=False,
-                   eye_in_hand=False):
+                   eye_in_hand=False, yaw_only=False):
         path = self.directory / name
         rng = np.random.default_rng(123)
         length = 6
@@ -52,8 +52,8 @@ class ObjectRotationTests(unittest.TestCase):
         with h5py.File(path, "w") as file:
             if not legacy:
                 file.attrs["control_orientation"] = mode
-                file.attrs["random_object_rotation"] = mode
-                file.attrs["object_yaw_range_deg"] = 45.0 if mode else 0.0
+                file.attrs["random_object_rotation"] = mode or yaw_only
+                file.attrs["object_yaw_range_deg"] = 45.0 if mode or yaw_only else 0.0
                 file.attrs["use_eye_in_hand"] = eye_in_hand
             demo = file.create_group("data/demo_00000")
             demo.create_dataset("actions", data=actions)
@@ -176,7 +176,8 @@ class ObjectRotationTests(unittest.TestCase):
         path, _ = self.write_demo(False, legacy=True)
         mode, environment = bc.read_dataset_config([path])
         self.assertFalse(mode)
-        self.assertEqual(environment, {"random_object_rotation": True, "object_yaw_range_deg": 180.0})
+        self.assertEqual(environment, {"random_object_rotation": True, "object_yaw_range_deg": 180.0,
+                                       "control_orientation": False})
         self.assertEqual(bc.checkpoint_environment_config({}), environment)
         legacy = bc.BCPolicy(12).state_dict()
         self.assertEqual(legacy["head.4.weight"].shape, (4, 128))
@@ -227,7 +228,78 @@ class ObjectRotationTests(unittest.TestCase):
             self.assertEqual(collector.OUTPUT_DIR, output)
             collect.assert_called_once_with(True, 30.0, num_demos=2,
                                             max_attempts=collector.MAX_ATTEMPTS,
-                                            use_eye_in_hand=False)
+                                            use_eye_in_hand=False,
+                                            control_orientation=True)
+
+    def test_yaw_only_dataset_and_cli_keep_orientation_actions_disabled(self):
+        for eye_in_hand in (False, True):
+            with self.subTest(eye_in_hand=eye_in_hand):
+                path, actions = self.write_demo(False, eye_in_hand=eye_in_hand,
+                                                yaw_only=True)
+                mode, environment = bc.read_dataset_config([path])
+                self.assertFalse(mode)
+                self.assertEqual(environment["random_object_rotation"], True)
+                self.assertEqual(environment["object_yaw_range_deg"], 45.0)
+                self.assertEqual(environment["control_orientation"], False)
+                self.assertEqual(environment.get("use_eye_in_hand", False), eye_in_hand)
+                np.testing.assert_array_equal(actions[:, 3:6], 0)
+                image_keys = (bc.IMAGE_KEY, bc.EYE_IN_HAND_KEY) if eye_in_hand else (bc.IMAGE_KEY,)
+                stats = bc.compute_stats([path], mode, bc.STATE_KEYS)
+                dataset = bc.EpisodeDataset([path], state_keys=bc.STATE_KEYS,
+                                            image_keys=image_keys, **stats)
+                try:
+                    image, state, motion, _ = dataset[0]
+                    self.assertEqual(tuple(image.shape), (3 * len(image_keys), 128, 128))
+                    self.assertEqual(len(state), 12)
+                    self.assertEqual(len(motion), 3)
+                    np.testing.assert_array_equal(
+                        bc.action_from_prediction(motion.numpy(), -1, stats)[3:6], 0
+                    )
+                finally:
+                    dataset.__del__()
+
+        output = self.directory / "yaw_only"
+        argv = ["collect_demos.py", "--random-object-yaw-only", "--eye-in-hand",
+                "--object-yaw-range-deg", "45", "--num-demos", "2",
+                "--output", str(output)]
+        with patch("sys.argv", argv), patch.object(collector, "collect") as collect, \
+                patch.object(collector, "OUTPUT_DIR", collector.OUTPUT_DIR), \
+                patch.object(collector, "RENDER", collector.RENDER):
+            collector.main()
+            self.assertEqual(collector.OUTPUT_DIR, output)
+            collect.assert_called_once_with(True, 45.0, num_demos=2,
+                                            max_attempts=collector.MAX_ATTEMPTS,
+                                            use_eye_in_hand=True,
+                                            control_orientation=False)
+
+        viewer_env = SimpleNamespace(close=lambda: None)
+        with patch("sys.argv", ["scripted_expert.py", "--random-object-yaw-only",
+                                "--episodes", "1", "--no-render"]), \
+                patch.object(viewer, "create_env", return_value=viewer_env) as create, \
+                patch.object(viewer, "evaluate"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            viewer.main()
+        create.assert_called_once_with(True, 45.0, control_orientation=False)
+
+    def test_yaw_only_checkpoint_restores_reset_distribution(self):
+        self.write_demo(False, "demo_00000.hdf5", yaw_only=True)
+        self.write_demo(False, "demo_00001.hdf5", yaw_only=True)
+        output = self.directory / "yaw_only_checkpoints"
+        args = SimpleNamespace(dataset=str(self.directory), output=str(output),
+                               epochs=1, batch_size=128, lr=1e-4,
+                               val_fraction=0.5, seed=123, cpu=True,
+                               resume=None, wandb=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.train(args)
+        checkpoint = torch.load(output / "bc_best.pt", map_location="cpu",
+                                weights_only=False)
+        self.assertFalse(checkpoint["predict_orientation"])
+        self.assertEqual(checkpoint["environment_config"], {
+            "random_object_rotation": True,
+            "object_yaw_range_deg": 45.0,
+            "control_orientation": False,
+        })
+        self.assertEqual(checkpoint["image_keys"], (bc.IMAGE_KEY,))
 
     def test_two_camera_dataset_and_checkpoint(self):
         path, _ = self.write_demo(True, eye_in_hand=True)

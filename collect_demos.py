@@ -93,9 +93,16 @@ class ThreeCubeLift(Lift):
 
     def __init__(
         self, *args, random_object_rotation=False,
-        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG, **kwargs,
+        object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
+        control_orientation=None, **kwargs,
     ):
         self.random_object_rotation = bool(random_object_rotation)
+        self.control_orientation = (
+            self.random_object_rotation if control_orientation is None
+            else bool(control_orientation)
+        )
+        if self.control_orientation and not self.random_object_rotation:
+            raise ValueError("Orientation control requires randomized object yaw")
         self.object_yaw_range_deg = float(object_yaw_range_deg)
         self.object_rotation = object_rotation_range(
             self.random_object_rotation, self.object_yaw_range_deg
@@ -195,7 +202,14 @@ def create_env(
     random_object_rotation=False,
     object_yaw_range_deg=DEFAULT_OBJECT_YAW_RANGE_DEG,
     use_eye_in_hand=False,
+    control_orientation=None,
 ):
+    control_orientation = (
+        bool(random_object_rotation) if control_orientation is None
+        else bool(control_orientation)
+    )
+    if control_orientation and not random_object_rotation:
+        raise ValueError("Orientation control requires randomized object yaw")
 
     controller = load_composite_controller_config(
         controller="BASIC",
@@ -207,7 +221,7 @@ def create_env(
     right["type"] = "OSC_POSE"
     right["input_type"] = "delta"
     right["impedance_mode"] = "fixed"
-    if random_object_rotation:
+    if control_orientation:
         right["input_ref_frame"] = "world"
 
     controller["body_parts"] = {"right": right}
@@ -216,6 +230,7 @@ def create_env(
         robots="Panda",
         random_object_rotation=random_object_rotation,
         object_yaw_range_deg=object_yaw_range_deg,
+        control_orientation=control_orientation,
         controller_configs=controller,
         initialization_noise={
             "magnitude": JOINT_NOISE_RAD,
@@ -232,6 +247,7 @@ def create_env(
         control_freq=CONTROL_FREQ,
         horizon=MAX_STEPS,
         ignore_done=True,
+        hard_reset=False,
         reward_shaping=False,
     )
 
@@ -303,7 +319,7 @@ def run_episode(env):
     initial_cube_quat = obs["cube_quat"].copy()
     initial_joints = obs["robot0_joint_pos"].copy()
     target_orientation = (
-        grasp_orientation(obs) if env.random_object_rotation else None
+        grasp_orientation(obs) if env.control_orientation else None
     )
 
     initial_blue, initial_green = env.get_distractor_positions()
@@ -595,13 +611,14 @@ def save_episode_file(demo_id, result, env):
         h5file.attrs["robot"] = "Panda"
         h5file.attrs["robosuite_version"] = getattr(suite, "__version__", "unknown")
         h5file.attrs["control_freq"] = CONTROL_FREQ
+        h5file.attrs["hard_reset"] = env.hard_reset
         h5file.attrs["seed"] = SEED
         h5file.attrs["joint_noise_deg"] = JOINT_NOISE_DEG
         h5file.attrs["cube_x_range"] = CUBE_X_RANGE
         h5file.attrs["cube_y_range"] = CUBE_Y_RANGE
         h5file.attrs["min_cube_distance_m"] = MIN_CUBE_DISTANCE
         h5file.attrs["random_object_rotation"] = env.random_object_rotation
-        h5file.attrs["control_orientation"] = env.random_object_rotation
+        h5file.attrs["control_orientation"] = env.control_orientation
         h5file.attrs["object_yaw_range_deg"] = (
             env.object_yaw_range_deg if env.random_object_rotation else 0.0
         )
@@ -627,7 +644,14 @@ def collect(
     num_demos=None,
     max_attempts=None,
     use_eye_in_hand=False,
+    control_orientation=None,
 ):
+    control_orientation = (
+        bool(random_object_rotation) if control_orientation is None
+        else bool(control_orientation)
+    )
+    if control_orientation and not random_object_rotation:
+        raise ValueError("Orientation control requires randomized object yaw")
     num_demos = NUM_DEMOS if num_demos is None else num_demos
     max_attempts = MAX_ATTEMPTS if max_attempts is None else max_attempts
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -635,7 +659,7 @@ def collect(
     for path in OUTPUT_DIR.glob("demo_*.hdf5"):
         with h5py.File(path, "r") as file:
             if (
-                bool(file.attrs.get("control_orientation", False)) != random_object_rotation
+                bool(file.attrs.get("control_orientation", False)) != control_orientation
                 or bool(file.attrs.get("random_object_rotation", True)) != random_object_rotation
             ):
                 raise ValueError(
@@ -671,7 +695,7 @@ def collect(
     print(f"Random object yaw:     {random_object_rotation}")
     if random_object_rotation:
         print(f"Object yaw range:      +/-{object_yaw_range_deg:g} degrees")
-    print(f"Orientation actions:   {random_object_rotation}")
+    print(f"Orientation actions:   {control_orientation}")
     print(f"Minimum cube lift:     {LIFT_HEIGHT - LIFT_TOLERANCE:.2f} m")
     print(f"Output directory:      {OUTPUT_DIR}")
     print("=" * 65, flush=True)
@@ -681,7 +705,8 @@ def collect(
         return
 
     env = create_env(random_object_rotation, object_yaw_range_deg,
-                     use_eye_in_hand=use_eye_in_hand)
+                     use_eye_in_hand=use_eye_in_hand,
+                     control_orientation=control_orientation)
     attempts = 0
     new_saved = 0
     total_steps = 0
@@ -703,6 +728,7 @@ def collect(
                 if bad_cameras:
                     print(f"[{attempts:04d}] REJECTED | Camera corruption: "
                           + "; ".join(bad_cameras), flush=True)
+                    del result
                     continue
                 while (OUTPUT_DIR / f"demo_{next_id:05d}.hdf5").exists():
                     next_id += 1
@@ -725,6 +751,7 @@ def collect(
                     f"Max lift {result['max_lift']:.3f}m",
                     flush=True,
                 )
+            del result
     finally:
         env.close()
 
@@ -750,8 +777,11 @@ def collect(
 def main():
     global OUTPUT_DIR, RENDER
     parser = argparse.ArgumentParser(description="Collect successful three-cube Lift demos")
-    parser.add_argument("--random-object-rotation", action="store_true",
-                        help="Randomize object yaw and control gripper orientation")
+    yaw_mode = parser.add_mutually_exclusive_group()
+    yaw_mode.add_argument("--random-object-rotation", action="store_true",
+                          help="Randomize object yaw and control gripper orientation")
+    yaw_mode.add_argument("--random-object-yaw-only", action="store_true",
+                          help="Randomize object yaw while keeping gripper orientation fixed")
     parser.add_argument("--eye-in-hand", action="store_true",
                         help="Record robot0_eye_in_hand_image alongside agentview_image")
     parser.add_argument("--object-yaw-range-deg", type=float,
@@ -765,8 +795,9 @@ def main():
     args = parser.parse_args()
     if args.num_demos < 1 or args.max_attempts < 1:
         parser.error("--num-demos and --max-attempts must be positive")
+    random_yaw = args.random_object_rotation or args.random_object_yaw_only
     try:
-        object_rotation_range(args.random_object_rotation, args.object_yaw_range_deg)
+        object_rotation_range(random_yaw, args.object_yaw_range_deg)
     except ValueError as error:
         parser.error(str(error))
 
@@ -774,12 +805,15 @@ def main():
         OUTPUT_DIR = args.output
     elif args.random_object_rotation:
         OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_rotation")
+    elif args.random_object_yaw_only:
+        OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_yaw_only")
     if args.eye_in_hand and args.output is None:
         OUTPUT_DIR = OUTPUT_DIR.with_name(OUTPUT_DIR.name + "_eye_in_hand")
     RENDER = args.render
-    collect(args.random_object_rotation, args.object_yaw_range_deg,
+    collect(random_yaw, args.object_yaw_range_deg,
             num_demos=args.num_demos, max_attempts=args.max_attempts,
-            use_eye_in_hand=args.eye_in_hand)
+            use_eye_in_hand=args.eye_in_hand,
+            control_orientation=args.random_object_rotation)
 
 
 if __name__ == "__main__":

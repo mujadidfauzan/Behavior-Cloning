@@ -149,6 +149,8 @@ def read_dataset_config(paths):
         "random_object_rotation": random_rotation,
         "object_yaw_range_deg": yaw_range if random_rotation else 45.0,
     }
+    if control_orientation != random_rotation:
+        environment["control_orientation"] = control_orientation
     if eye_in_hand:
         environment["use_eye_in_hand"] = True
     return control_orientation, environment
@@ -173,6 +175,7 @@ def checkpoint_environment_config(checkpoint):
     # Preserve the full-yaw reset distribution of checkpoints predating this flag.
     return checkpoint.get("environment_config", {
         "random_object_rotation": True, "object_yaw_range_deg": 180.0,
+        "control_orientation": False,
     })
 
 
