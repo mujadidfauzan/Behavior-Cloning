@@ -22,7 +22,9 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
 from camera_quality import suspicious_frames
+from eval_trace import RISE_THRESHOLD_M, STEP_FIELDS, EpisodeTrace
 
 
 def init_wandb(args, job_type, config):
@@ -45,7 +47,9 @@ def init_wandb(args, job_type, config):
     return run
 
 
-def log_training_camera_samples(run, paths, max_images=6, image_keys=("agentview_image",)):
+def log_training_camera_samples(
+    run, paths, max_images=6, image_keys=("agentview_image",)
+):
     """Show held-out demonstration camera frames on the training dashboard."""
     if run is None:
         return
@@ -61,7 +65,9 @@ def log_training_camera_samples(run, paths, max_images=6, image_keys=("agentview
                 # Robosuite camera observations are vertically flipped for display.
                 rgb = np.flipud(np.asarray(images[index])).copy()
                 samples.append(
-                    wandb.Image(rgb, caption=f"{path.stem} | {key} | step {index} | validation")
+                    wandb.Image(
+                        rgb, caption=f"{path.stem} | {key} | step {index} | validation"
+                    )
                 )
     if samples:
         run.log({"data/validation_robot_camera": samples})
@@ -88,6 +94,16 @@ def render_third_person(env, camera_name, size):
     # Explicit offscreen render; no on-screen viewer is needed.
     frame = env.sim.render(width=size, height=size, camera_name=camera_name)
     return np.flipud(np.asarray(frame)).copy()
+
+
+def cube_grasp_contact(env):
+    """Use Robosuite's grasp check when the collector exposes the red cube."""
+    robots = getattr(env, "robots", None)
+    cube = getattr(env, "cube", None)
+    check_grasp = getattr(env, "_check_grasp", None)
+    if not robots or cube is None or check_grasp is None:
+        return None
+    return bool(check_grasp(gripper=robots[0].gripper, object_geoms=cube))
 
 
 def log_episode_videos(run, ep, robot_frames, third_frames, third_camera, fps):
@@ -119,15 +135,21 @@ STATE_KEYS = ("robot0_joint_pos", "robot0_eef_pos", "robot0_gripper_qpos")
 
 
 def image_keys_from_checkpoint(checkpoint):
-    return tuple(checkpoint.get("image_keys", (checkpoint.get("image_key", IMAGE_KEY),)))
+    return tuple(
+        checkpoint.get("image_keys", (checkpoint.get("image_key", IMAGE_KEY),))
+    )
 
 
 def image_from_observation(obs, image_keys):
     """Stack normalized RGB cameras along channels in checkpoint order."""
-    return torch.cat([
-        torch.from_numpy(np.asarray(obs[key]).copy()).permute(2, 0, 1).float() / 255.0
-        for key in image_keys
-    ], dim=0)
+    return torch.cat(
+        [
+            torch.from_numpy(np.asarray(obs[key]).copy()).permute(2, 0, 1).float()
+            / 255.0
+            for key in image_keys
+        ],
+        dim=0,
+    )
 
 
 def read_dataset_config(paths):
@@ -140,10 +162,18 @@ def read_dataset_config(paths):
             random_rotation = bool(file.attrs.get("random_object_rotation", True))
             yaw_range = float(file.attrs.get("object_yaw_range_deg", 180.0))
             eye_in_hand = bool(file.attrs.get("use_eye_in_hand", False))
-            configurations.add((control_orientation, random_rotation,
-                                yaw_range if random_rotation else 0.0, eye_in_hand))
+            configurations.add(
+                (
+                    control_orientation,
+                    random_rotation,
+                    yaw_range if random_rotation else 0.0,
+                    eye_in_hand,
+                )
+            )
     if len(configurations) != 1:
-        raise ValueError("Dataset mixes rotation configurations; train each dataset separately")
+        raise ValueError(
+            "Dataset mixes rotation configurations; train each dataset separately"
+        )
     control_orientation, random_rotation, yaw_range, eye_in_hand = configurations.pop()
     environment = {
         "random_object_rotation": random_rotation,
@@ -167,16 +197,21 @@ def action_from_prediction(motion, grip_logit, stats):
         )
     elif len(motion) != 3:
         raise ValueError(f"Expected 3 or 6 motion values, got {len(motion)}")
-    action[6] = 1.0 if grip_logit > 0 else -1.0
+    # print(f" Grip logit: {grip_logit:.3f}", flush=True)
+    action[6] = 1.0 if grip_logit > -0.5 else -1.0
     return action
 
 
 def checkpoint_environment_config(checkpoint):
     # Preserve the full-yaw reset distribution of checkpoints predating this flag.
-    return checkpoint.get("environment_config", {
-        "random_object_rotation": True, "object_yaw_range_deg": 180.0,
-        "control_orientation": False,
-    })
+    return checkpoint.get(
+        "environment_config",
+        {
+            "random_object_rotation": True,
+            "object_yaw_range_deg": 180.0,
+            "control_orientation": False,
+        },
+    )
 
 
 def seed_all(seed):
@@ -222,15 +257,23 @@ def read_demo_info(path, state_keys=STATE_KEYS, image_keys=(IMAGE_KEY,)):
 
 class EpisodeDataset(Dataset):
     def __init__(
-        self, paths, state_mean, state_std, xyz_mean, xyz_std,
-        rotation_mean=None, rotation_std=None, state_keys=STATE_KEYS,
+        self,
+        paths,
+        state_mean,
+        state_std,
+        xyz_mean,
+        xyz_std,
+        rotation_mean=None,
+        rotation_std=None,
+        state_keys=STATE_KEYS,
         image_keys=(IMAGE_KEY,),
     ):
         self.paths = [str(p) for p in paths]
         self.state_keys = tuple(state_keys)
         self.image_keys = tuple(image_keys)
-        self.lengths = [read_demo_info(p, self.state_keys, self.image_keys)[0]
-                        for p in self.paths]
+        self.lengths = [
+            read_demo_info(p, self.state_keys, self.image_keys)[0] for p in self.paths
+        ]
         self.ends = np.cumsum(self.lengths).tolist()
         self.state_mean = torch.tensor(state_mean, dtype=torch.float32)
         self.state_std = torch.tensor(state_std, dtype=torch.float32)
@@ -276,6 +319,83 @@ class EpisodeDataset(Dataset):
                 f.close()
             except Exception:
                 pass
+
+
+class EpisodeSequenceDataset(EpisodeDataset):
+    """Causal windows from one demo at a time; padded steps carry no loss."""
+
+    def __init__(self, paths, *args, sequence_length=16, sequence_stride=8, **kwargs):
+        super().__init__(paths, *args, **kwargs)
+        if sequence_length < 1 or sequence_stride < 1:
+            raise ValueError("Sequence length and stride must be positive")
+        self.sequence_length = sequence_length
+        self.windows = [
+            (file_index, start)
+            for file_index, length in enumerate(self.lengths)
+            for start in range(0, length, sequence_stride)
+        ]
+        if not self.windows:
+            raise ValueError("Temporal training needs nonempty demonstrations")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, index):
+        file_index, start = self.windows[index]
+        path = self.paths[file_index]
+        if path not in self.handles:
+            self.handles[path] = h5py.File(path, "r")
+        f = self.handles[path]
+        g = f["data"][next(iter(f["data"].keys()))]
+        end = min(start + self.sequence_length, self.lengths[file_index])
+        valid = end - start
+        images = torch.cat(
+            [
+                torch.from_numpy(np.asarray(g["obs"][key][start:end]).copy())
+                .permute(0, 3, 1, 2)
+                .float()
+                / 255.0
+                for key in self.image_keys
+            ],
+            dim=1,
+        )
+        state = np.concatenate(
+            [g["obs"][key][start:end] for key in self.state_keys], axis=1
+        ).astype(np.float32)
+        state = (torch.from_numpy(state) - self.state_mean) / self.state_std
+        action = np.asarray(g["actions"][start:end], dtype=np.float32)
+        motion = (
+            torch.from_numpy(action[:, : len(self.motion_mean)].copy())
+            - self.motion_mean
+        ) / self.motion_std
+        gripper = torch.from_numpy((action[:, 6:7] > 0).astype(np.float32))
+        if start == 0:
+            previous = np.concatenate(([-1.0], action[:-1, 6]))
+        else:
+            previous = np.asarray(g["actions"][start - 1 : end - 1, 6])
+        previous_gripper = torch.from_numpy(
+            np.where(previous > 0, 1.0, -1.0).astype(np.float32)[:, None]
+        )
+        mask = torch.zeros(self.sequence_length, dtype=torch.float32)
+        mask[:valid] = 1.0
+        if valid < self.sequence_length:
+
+            def pad_last(value):
+                return torch.cat(
+                    (
+                        value,
+                        value[-1:].expand(
+                            self.sequence_length - valid, *value.shape[1:]
+                        ),
+                    ),
+                    dim=0,
+                )
+
+            images, state, motion, gripper, previous_gripper = (
+                pad_last(value)
+                for value in (images, state, motion, gripper, previous_gripper)
+            )
+        return images, state, previous_gripper, motion, gripper, mask
 
 
 def compute_stats(paths, predict_orientation=False, state_keys=STATE_KEYS):
@@ -356,6 +476,63 @@ class BCPolicy(nn.Module):
         return out[:, : self.motion_dim], out[:, self.motion_dim :]
 
 
+class TemporalBCPolicy(BCPolicy):
+    """One recurrent policy step per observation, with the previous gripper command."""
+
+    def __init__(self, state_dim, predict_orientation=False, num_cameras=1):
+        super().__init__(state_dim, predict_orientation, num_cameras)
+        self.gru = nn.GRU(256 * num_cameras + state_dim + 1, 256, batch_first=True)
+        self.head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, self.motion_dim + 1),
+        )
+
+    def forward(self, images, states, previous_gripper, hidden=None):
+        batch, steps, channels, height, width = images.shape
+        if channels != 3 * self.num_cameras:
+            raise ValueError(f"Expected {3 * self.num_cameras} image channels")
+        flat = images.reshape(batch * steps, channels, height, width)
+        visual = self.vision(flat[:, :3])
+        if self.num_cameras == 2:
+            visual = torch.cat([visual, self.eye_vision(flat[:, 3:])], dim=1)
+        features = torch.cat(
+            (visual.reshape(batch, steps, -1), states, previous_gripper), dim=-1
+        )
+        recurrent, hidden = self.gru(features, hidden)
+        out = self.head(recurrent)
+        return out[..., : self.motion_dim], out[..., self.motion_dim :], hidden
+
+
+def policy_from_checkpoint(checkpoint, device):
+    policy_type = checkpoint.get("policy_type", "frame")
+    if policy_type not in ("frame", "temporal_gru"):
+        raise ValueError(f"Unknown checkpoint policy_type: {policy_type}")
+    policy_class = TemporalBCPolicy if policy_type == "temporal_gru" else BCPolicy
+    model = policy_class(
+        checkpoint["state_dim"],
+        predict_orientation=checkpoint.get("predict_orientation", False),
+        num_cameras=len(image_keys_from_checkpoint(checkpoint)),
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+    return model
+
+
+def predict_step(model, image, state, previous_gripper=-1.0, hidden=None):
+    """Run one rollout step, retaining memory only for temporal checkpoints."""
+    if isinstance(model, TemporalBCPolicy):
+        grip_input = torch.full(
+            (len(image), 1, 1), previous_gripper, dtype=state.dtype, device=state.device
+        )
+        motion, grip_logit, hidden = model(
+            image.unsqueeze(1), state.unsqueeze(1), grip_input, hidden
+        )
+        return motion[:, 0], grip_logit[:, 0], hidden
+    motion, grip_logit = model(image, state)
+    return motion, grip_logit, None
+
+
 def epoch_pass(model, loader, device, optimizer=None):
     training = optimizer is not None
     model.train(training)
@@ -369,7 +546,8 @@ def epoch_pass(model, loader, device, optimizer=None):
             xyz_loss = nn.functional.mse_loss(pred_motion[:, :3], motion[:, :3])
             rotation_loss = (
                 nn.functional.mse_loss(pred_motion[:, 3:6], motion[:, 3:6])
-                if model.predict_orientation else pred_motion.new_zeros(())
+                if model.predict_orientation
+                else pred_motion.new_zeros(())
             )
             grip_loss = nn.functional.binary_cross_entropy_with_logits(
                 grip_logit, gripper
@@ -388,6 +566,46 @@ def epoch_pass(model, loader, device, optimizer=None):
     return total_loss / n, total_xyz / n, total_grip / n, total_rotation / n
 
 
+def temporal_epoch_pass(model, loader, device, optimizer=None):
+    training = optimizer is not None
+    model.train(training)
+    total_loss = total_xyz = total_grip = total_rotation = n = 0.0
+    for images, states, previous_gripper, motion, gripper, mask in loader:
+        images, states, previous_gripper, motion, gripper, mask = (
+            value.to(device)
+            for value in (images, states, previous_gripper, motion, gripper, mask)
+        )
+        valid = mask.sum()
+        with torch.set_grad_enabled(training):
+            predicted, grip_logit, _ = model(images, states, previous_gripper)
+
+            def masked_mse(pred, target):
+                return (((pred - target) ** 2).mean(dim=-1) * mask).sum() / valid
+
+            xyz_loss = masked_mse(predicted[..., :3], motion[..., :3])
+            rotation_loss = (
+                masked_mse(predicted[..., 3:6], motion[..., 3:6])
+                if model.predict_orientation
+                else predicted.new_zeros(())
+            )
+            grip_each = nn.functional.binary_cross_entropy_with_logits(
+                grip_logit, gripper, reduction="none"
+            ).squeeze(-1)
+            grip_loss = (grip_each * mask).sum() / valid
+            loss = xyz_loss + rotation_loss + 0.2 * grip_loss
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+        weight = valid.item()
+        total_loss += loss.item() * weight
+        total_xyz += xyz_loss.item() * weight
+        total_grip += grip_loss.item() * weight
+        total_rotation += rotation_loss.item() * weight
+        n += weight
+    return total_loss / n, total_xyz / n, total_grip / n, total_rotation / n
+
+
 def train(args):
     seed_all(args.seed)
     paths = sorted(Path(args.dataset).glob("demo_*.hdf5"))
@@ -397,16 +615,58 @@ def train(args):
         )
     predict_orientation, environment_config = read_dataset_config(paths)
     state_keys = STATE_KEYS + (("robot0_eef_quat",) if predict_orientation else ())
-    image_keys = (IMAGE_KEY, EYE_IN_HAND_KEY) if environment_config.get(
-        "use_eye_in_hand", False
-    ) else (IMAGE_KEY,)
+    image_keys = (
+        (IMAGE_KEY, EYE_IN_HAND_KEY)
+        if environment_config.get("use_eye_in_hand", False)
+        else (IMAGE_KEY,)
+    )
     output = Path(args.output)
     if args.resume and output.resolve() != Path(args.resume).resolve().parent:
         raise ValueError("--output must be the directory containing --resume")
     checkpoint = (
         torch.load(args.resume, map_location="cpu", weights_only=False)
-        if args.resume else None
+        if args.resume
+        else None
     )
+    saved_policy_type = checkpoint.get("policy_type", "frame") if checkpoint else None
+    if saved_policy_type not in (None, "frame", "temporal_gru"):
+        raise ValueError(f"Unknown checkpoint policy_type: {saved_policy_type}")
+    temporal = (
+        bool(getattr(args, "temporal", False)) or saved_policy_type == "temporal_gru"
+    )
+    if checkpoint is not None and temporal != (saved_policy_type == "temporal_gru"):
+        raise ValueError("--temporal does not match the checkpoint architecture")
+    sequence_length = getattr(args, "sequence_length", None)
+    sequence_stride = getattr(args, "sequence_stride", None)
+    if temporal:
+        saved_length = checkpoint.get("sequence_length", 16) if checkpoint else 16
+        saved_stride = checkpoint.get("sequence_stride", 8) if checkpoint else 8
+        if (
+            checkpoint
+            and sequence_length is not None
+            and sequence_length != saved_length
+        ):
+            raise ValueError("--sequence-length differs from checkpoint")
+        if (
+            checkpoint
+            and sequence_stride is not None
+            and sequence_stride != saved_stride
+        ):
+            raise ValueError("--sequence-stride differs from checkpoint")
+        sequence_length = saved_length if sequence_length is None else sequence_length
+        sequence_stride = saved_stride if sequence_stride is None else sequence_stride
+        if (
+            sequence_length < 1
+            or sequence_stride < 1
+            or sequence_stride > sequence_length
+        ):
+            raise ValueError("Need 1 <= sequence-stride <= sequence-length")
+    elif sequence_length is not None or sequence_stride is not None:
+        raise ValueError("--sequence-length and --sequence-stride require --temporal")
+    batch_size = getattr(args, "batch_size", None)
+    batch_size = (8 if temporal else 128) if batch_size is None else batch_size
+    if batch_size < 1:
+        raise ValueError("--batch-size must be positive")
     if checkpoint is not None:
         if checkpoint.get("predict_orientation", False) != predict_orientation:
             raise ValueError("Checkpoint orientation mode differs from dataset")
@@ -424,9 +684,11 @@ def train(args):
             split = json.loads(split_path.read_text())
         by_name = {path.name: path for path in paths}
         train_names, val_names = split["train"], split["val"]
-        if (len(train_names) + len(val_names) != len(paths)
-                or len(set(train_names + val_names)) != len(paths)
-                or set(train_names + val_names) != set(by_name)):
+        if (
+            len(train_names) + len(val_names) != len(paths)
+            or len(set(train_names + val_names)) != len(paths)
+            or set(train_names + val_names) != set(by_name)
+        ):
             raise ValueError("Dataset files differ from checkpoint training split")
         train_paths = [by_name[name] for name in train_names]
         val_paths = [by_name[name] for name in val_names]
@@ -434,31 +696,55 @@ def train(args):
         random.Random(args.seed).shuffle(paths)
         n_val = max(1, round(len(paths) * args.val_fraction))
         val_paths, train_paths = paths[:n_val], paths[n_val:]
-        split = {"train": [p.name for p in train_paths],
-                 "val": [p.name for p in val_paths]}
+        split = {
+            "train": [p.name for p in train_paths],
+            "val": [p.name for p in val_paths],
+        }
     state_dims = {read_demo_info(p, state_keys, image_keys)[1] for p in paths}
     if len(state_dims) != 1:
         raise RuntimeError(f"Inconsistent state dimensions: {state_dims}")
-    stats = checkpoint["stats"] if checkpoint is not None else compute_stats(
-        train_paths, predict_orientation, state_keys
+    stats = (
+        checkpoint["stats"]
+        if checkpoint is not None
+        else compute_stats(train_paths, predict_orientation, state_keys)
     )
     if len(stats["state_mean"]) != next(iter(state_dims)):
         raise ValueError("Checkpoint state dimension differs from dataset")
-    train_set = EpisodeDataset(train_paths, state_keys=state_keys,
-                               image_keys=image_keys, **stats)
-    val_set = EpisodeDataset(val_paths, state_keys=state_keys,
-                             image_keys=image_keys, **stats)
+    dataset_class = EpisodeSequenceDataset if temporal else EpisodeDataset
+    sequence_options = (
+        {"sequence_length": sequence_length, "sequence_stride": sequence_stride}
+        if temporal
+        else {}
+    )
+    train_set = dataset_class(
+        train_paths,
+        state_keys=state_keys,
+        image_keys=image_keys,
+        **stats,
+        **sequence_options,
+    )
+    val_set = dataset_class(
+        val_paths,
+        state_keys=state_keys,
+        image_keys=image_keys,
+        **stats,
+        **sequence_options,
+    )
     train_loader = DataLoader(
-        train_set, batch_size=args.batch_size, shuffle=True, num_workers=0
+        train_set, batch_size=batch_size, shuffle=True, num_workers=0
     )
     val_loader = DataLoader(
-        val_set, batch_size=args.batch_size, shuffle=False, num_workers=0
+        val_set, batch_size=batch_size, shuffle=False, num_workers=0
     )
     device = torch.device(
         "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     )
-    model = BCPolicy(state_dims.pop(), predict_orientation=predict_orientation,
-                     num_cameras=len(image_keys)).to(device)
+    model_class = TemporalBCPolicy if temporal else BCPolicy
+    model = model_class(
+        state_dims.pop(),
+        predict_orientation=predict_orientation,
+        num_cameras=len(image_keys),
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     start_epoch = 1
     best = float("inf")
@@ -471,7 +757,10 @@ def train(args):
             for group in optimizer.param_groups:
                 group["lr"] = args.lr
         else:
-            print("Checkpoint lama: optimizer tidak tersimpan; optimizer dimulai ulang.", flush=True)
+            print(
+                "Checkpoint lama: optimizer tidak tersimpan; optimizer dimulai ulang.",
+                flush=True,
+            )
         if start_epoch > args.epochs:
             raise ValueError(
                 f"Checkpoint is at epoch {start_epoch - 1}; --epochs must be greater"
@@ -486,10 +775,15 @@ def train(args):
             "dataset": str(args.dataset),
             "train_episodes": len(train_paths),
             "val_episodes": len(val_paths),
-            "train_transitions": len(train_set),
-            "val_transitions": len(val_set),
+            "train_transitions": sum(train_set.lengths),
+            "val_transitions": sum(val_set.lengths),
+            "train_windows": len(train_set) if temporal else None,
+            "val_windows": len(val_set) if temporal else None,
             "epochs": args.epochs,
-            "batch_size": args.batch_size,
+            "batch_size": batch_size,
+            "policy_type": "temporal_gru" if temporal else "frame",
+            "sequence_length": sequence_length,
+            "sequence_stride": sequence_stride,
             "lr": args.lr,
             "seed": args.seed,
             "val_fraction": args.val_fraction,
@@ -505,18 +799,29 @@ def train(args):
     if run is not None:
         print(f"W&B dashboard: {run.url}", flush=True)
         log_training_camera_samples(run, val_paths, image_keys=image_keys)
-    print(f"Orientation actions: {predict_orientation} | Cameras: {image_keys} | State keys: {state_keys}", flush=True)
+    print(
+        f"Policy: {'temporal_gru' if temporal else 'frame'} | "
+        f"Orientation actions: {predict_orientation} | Cameras: {image_keys} | State keys: {state_keys}",
+        flush=True,
+    )
+    if temporal:
+        print(
+            f"Sequence length: {sequence_length} | Stride: {sequence_stride} | "
+            f"Batch: {batch_size} windows | Train/val windows: {len(train_set)}/{len(val_set)}",
+            flush=True,
+        )
     if checkpoint is not None:
         print(f"Resuming from epoch {start_epoch - 1} to {args.epochs}", flush=True)
     print(
-        f"Train: {len(train_paths)} episodes/{len(train_set)} transitions | "
-        f"Validation: {len(val_paths)} episodes/{len(val_set)} transitions | Device: {device}",
+        f"Train: {len(train_paths)} episodes/{sum(train_set.lengths)} transitions | "
+        f"Validation: {len(val_paths)} episodes/{sum(val_set.lengths)} transitions | Device: {device}",
         flush=True,
     )
+    pass_epoch = temporal_epoch_pass if temporal else epoch_pass
     try:
         for epoch in range(start_epoch, args.epochs + 1):
-            tr = epoch_pass(model, train_loader, device, optimizer)
-            va = epoch_pass(model, val_loader, device)
+            tr = pass_epoch(model, train_loader, device, optimizer)
+            va = pass_epoch(model, val_loader, device)
             improved = va[0] < best
             if improved:
                 best = va[0]
@@ -533,6 +838,9 @@ def train(args):
                 "predict_orientation": predict_orientation,
                 "environment_config": environment_config,
                 "split": split,
+                "policy_type": "temporal_gru" if temporal else "frame",
+                "sequence_length": sequence_length,
+                "sequence_stride": sequence_stride,
             }
             if improved:
                 torch.save(saved, output / "bc_best.pt")
@@ -596,13 +904,8 @@ def evaluate(args):
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     image_keys = image_keys_from_checkpoint(checkpoint)
-    model = BCPolicy(
-        checkpoint["state_dim"],
-        predict_orientation=checkpoint.get("predict_orientation", False),
-        num_cameras=len(image_keys),
-    ).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+    model = policy_from_checkpoint(checkpoint, device)
+    policy_type = checkpoint.get("policy_type", "frame")
     stats = checkpoint["stats"]
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
@@ -633,6 +936,7 @@ def evaluate(args):
         "eval",
         {
             "algorithm": "BC",
+            "policy_type": policy_type,
             "checkpoint": str(args.checkpoint),
             "episodes_per_seed": args.episodes,
             "num_seeds": args.num_seeds,
@@ -660,7 +964,12 @@ def evaluate(args):
     videos_logged = 0
     original_render = getattr(collector, "RENDER", False)
     original_realtime = getattr(collector, "REALTIME_RENDER", False)
+    trace_path = output / "bc_eval_steps.csv"
+    # Stream each row so an interrupted evaluation still leaves useful traces.
+    trace_file = trace_path.open("w", newline="", buffering=1)
     try:
+        trace_writer = csv.DictWriter(trace_file, fieldnames=STEP_FIELDS)
+        trace_writer.writeheader()
         collector.RENDER = bool(args.render)
         collector.REALTIME_RENDER = False
         for seed_index, seed in enumerate(seeds, start=1):
@@ -697,6 +1006,8 @@ def evaluate(args):
                 )
                 for ep in range(1, args.episodes + 1):
                     obs = env.reset()
+                    hidden = None
+                    previous_gripper = -1.0
                     global_episode += 1
                     # Spread recordings across seeds, starting with episode 1 of each seed.
                     capture_wandb = (
@@ -725,6 +1036,7 @@ def evaluate(args):
                     last_eef_delta = 0.0
                     last_gripper = -1.0
                     episode_images = {}
+                    episode_trace = EpisodeTrace(initial_z, args.small_action_threshold)
                     for step in range(args.max_steps):
                         if capture and step % args.video_stride == 0:
                             robot_frames.append(
@@ -748,9 +1060,11 @@ def evaluate(args):
                         prev_eef = np.asarray(
                             obs["robot0_eef_pos"], dtype=np.float64
                         ).copy()
-                        image = image_from_observation(
-                            obs, image_keys
-                        ).unsqueeze(0).to(device)
+                        image = (
+                            image_from_observation(obs, image_keys)
+                            .unsqueeze(0)
+                            .to(device)
+                        )
                         state = np.concatenate([obs[k] for k in state_keys]).astype(
                             np.float32
                         )
@@ -760,14 +1074,40 @@ def evaluate(args):
                             .to(device)
                         )
                         with torch.no_grad():
-                            pred_motion, grip_logit = model(image, state)
+                            pred_motion, grip_logit, hidden = predict_step(
+                                model, image, state, previous_gripper, hidden
+                            )
+                        grip_logit_value = grip_logit.item()
                         action = action_from_prediction(
-                            pred_motion[0].cpu().numpy(), grip_logit.item(), stats
+                            pred_motion[0].cpu().numpy(), grip_logit_value, stats
                         )
                         action = np.clip(action, low, high)
+                        previous_gripper = float(action[6])
                         last_action_norm = float(np.linalg.norm(action[:3]))
                         last_gripper = float(action[6])
+                        trace_obs_before = {
+                            key: np.asarray(obs[key]).copy()
+                            for key in (
+                                "robot0_eef_pos",
+                                "robot0_gripper_qpos",
+                                "cube_pos",
+                            )
+                        }
                         obs, _, _, _ = env.step(action)
+                        trace_writer.writerow(
+                            episode_trace.record(
+                                seed=seed,
+                                episode=ep,
+                                global_episode=global_episode,
+                                step=step + 1,
+                                freq=freq,
+                                obs_before=trace_obs_before,
+                                action=action,
+                                obs_after=obs,
+                                gripper_logit=grip_logit_value,
+                                grasp_contact_after=cube_grasp_contact(env),
+                            )
+                        )
                         last_eef_delta = float(
                             np.linalg.norm(
                                 np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
@@ -835,12 +1175,15 @@ def evaluate(args):
                         "max_consecutive_stationary_steps": max_stationary_steps,
                         "stagnation_observed": int(stagnation_observed),
                     }
+                    row.update(episode_trace.summary())
                     episode_rows.append(row)
                     if capture_local and robot_frames:
                         fps = max(1, round(freq / args.video_stride))
                         stem = f"seed_{seed}_episode_{ep:03d}_{termination}"
-                        recordings = [("agentview", robot_frames),
-                                      (third_camera, third_frames)]
+                        recordings = [
+                            ("agentview", robot_frames),
+                            (third_camera, third_frames),
+                        ]
                         if eye_frames:
                             recordings.append(("robot0_eye_in_hand", eye_frames))
                         for name, frames in recordings:
@@ -952,6 +1295,7 @@ def evaluate(args):
         total_success = sum(r["successes"] for r in seed_rows)
         summary = {
             "algorithm": "BC",
+            "policy_type": policy_type,
             "checkpoint": str(args.checkpoint),
             "predict_orientation": model.predict_orientation,
             "image_keys": list(image_keys),
@@ -968,6 +1312,9 @@ def evaluate(args):
             "lift_threshold_m": lift_threshold,
             "lift_hold_steps": hold_steps,
             "stagnation_episodes": sum(r["stagnation_observed"] for r in episode_rows),
+            "step_trace_file": trace_path.name,
+            "rise_event_threshold_m": RISE_THRESHOLD_M,
+            "upward_action_threshold": args.small_action_threshold,
         }
         with (output / "bc_eval_episodes.csv").open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(episode_rows[0]))
@@ -991,6 +1338,7 @@ def evaluate(args):
             f'Overall: {total_success}/{len(episode_rows)} = {100*summary["overall_success_rate"]:.2f}%'
         )
         print(f"Results: {output.resolve()}")
+        print(f"Per-step trace: {trace_path.resolve()}")
         print("=" * 66, flush=True)
         if run is not None:
             run.summary["eval/mean_success_rate"] = mean_rate
@@ -1021,6 +1369,7 @@ def evaluate(args):
                 step=global_episode + 1,
             )
     finally:
+        trace_file.close()
         collector.RENDER = original_render
         collector.REALTIME_RENDER = original_realtime
         if run is not None:
@@ -1036,13 +1385,36 @@ def main():
     t.add_argument("--dataset", default="datasets/three_cube_lift")
     t.add_argument("--output", default="checkpoints")
     t.add_argument("--epochs", type=int, default=100)
-    t.add_argument("--batch-size", type=int, default=128)
+    t.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Windows per batch for --temporal (default 8); frames otherwise (default 128)",
+    )
+    t.add_argument(
+        "--temporal",
+        action="store_true",
+        help="Train a causal GRU on sequences of observations and previous gripper commands",
+    )
+    t.add_argument(
+        "--sequence-length",
+        type=int,
+        default=None,
+        help="Steps per temporal training window (default 16)",
+    )
+    t.add_argument(
+        "--sequence-stride",
+        type=int,
+        default=None,
+        help="Steps between temporal training windows (default 8)",
+    )
     t.add_argument("--lr", type=float, default=1e-4)
     t.add_argument("--val-fraction", type=float, default=0.1)
     t.add_argument("--seed", type=int, default=123)
     t.add_argument("--cpu", action="store_true")
     t.add_argument(
-        "--resume", default=None,
+        "--resume",
+        default=None,
         help="Resume training from bc_last.pt (or an older bc_best.pt); --epochs is the total target epoch",
     )
     e = sub.add_parser("eval")
@@ -1070,7 +1442,12 @@ def main():
         default=0.0001,
         help="EEF displacement threshold in meters per simulation step",
     )
-    e.add_argument("--small-action-threshold", type=float, default=0.01)
+    e.add_argument(
+        "--small-action-threshold",
+        type=float,
+        default=0.01,
+        help="Positive action Z threshold for the first upward-command trace event",
+    )
     e.add_argument(
         "--diagnostic-interval",
         type=int,
@@ -1083,7 +1460,8 @@ def main():
         "--log-videos", action="store_true", help="Log both camera views to W&B"
     )
     e.add_argument(
-        "--record-videos", action="store_true",
+        "--record-videos",
+        action="store_true",
         help="Save agentview and third-person MP4s locally for the first --video-episodes rollouts",
     )
     e.add_argument(

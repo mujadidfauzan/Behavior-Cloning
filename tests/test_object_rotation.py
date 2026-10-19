@@ -1,6 +1,7 @@
 """Rotation-mode regressions for sampling, expert actions, and BC checkpoints."""
 
 import contextlib
+import csv
 import io
 import json
 import tempfile
@@ -210,6 +211,83 @@ class ObjectRotationTests(unittest.TestCase):
         self.assertGreaterEqual(
             next(iter(second["optimizer"]["state"].values()))["step"], 2
         )
+
+    def test_temporal_windows_keep_episode_boundaries_and_previous_gripper(self):
+        first, first_actions = self.write_demo(True, "demo_00000.hdf5", eye_in_hand=True)
+        second, second_actions = self.write_demo(True, "demo_00001.hdf5", eye_in_hand=True)
+        state_keys = bc.STATE_KEYS + ("robot0_eef_quat",)
+        image_keys = (bc.IMAGE_KEY, bc.EYE_IN_HAND_KEY)
+        stats = bc.compute_stats([first, second], True, state_keys)
+        dataset = bc.EpisodeSequenceDataset(
+            [first, second], state_keys=state_keys, image_keys=image_keys,
+            sequence_length=4, sequence_stride=3, **stats
+        )
+        try:
+            self.assertEqual(len(dataset), 4)
+            images, states, previous, motion, gripper, mask = dataset[1]
+            self.assertEqual(tuple(images.shape), (4, 6, 128, 128))
+            self.assertEqual(tuple(states.shape), (4, 16))
+            self.assertEqual(tuple(motion.shape), (4, 6))
+            np.testing.assert_array_equal(mask.numpy(), [1, 1, 1, 0])
+            np.testing.assert_array_equal(previous[:3, 0].numpy(), first_actions[2:5, 6])
+            np.testing.assert_array_equal(gripper[:3, 0].numpy(), [1, 0, 1])
+            self.assertEqual(previous[3, 0].item(), previous[2, 0].item())
+            self.assertEqual(dataset[2][2][0, 0].item(), -1.0)
+            np.testing.assert_array_equal(dataset[3][2][:3, 0].numpy(), second_actions[2:5, 6])
+
+            model = bc.TemporalBCPolicy(16, predict_orientation=True, num_cameras=2)
+            loader = DataLoader(dataset, batch_size=2)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+            metrics = bc.temporal_epoch_pass(model, loader, "cpu", optimizer)
+            self.assertTrue(np.isfinite(metrics).all())
+            restored = bc.policy_from_checkpoint({
+                "policy_type": "temporal_gru", "state_dim": 16,
+                "predict_orientation": True, "image_keys": image_keys,
+                "model": model.state_dict(),
+            }, "cpu")
+            self.assertIsInstance(restored, bc.TemporalBCPolicy)
+            with torch.no_grad():
+                full_motion, full_grip, _ = restored(
+                    images[:3].unsqueeze(0), states[:3].unsqueeze(0),
+                    previous[:3].unsqueeze(0),
+                )
+                hidden = None
+                for step in range(3):
+                    step_motion, step_grip, hidden = bc.predict_step(
+                        restored, images[step].unsqueeze(0), states[step].unsqueeze(0),
+                        previous[step, 0].item(), hidden,
+                    )
+                    torch.testing.assert_close(step_motion, full_motion[:, step])
+                    torch.testing.assert_close(step_grip, full_grip[:, step])
+        finally:
+            dataset.__del__()
+
+    def test_temporal_training_resumes_from_its_own_checkpoint(self):
+        self.write_demo(False, "demo_00000.hdf5")
+        self.write_demo(False, "demo_00001.hdf5")
+        output = self.directory / "temporal_checkpoints"
+        args = SimpleNamespace(
+            dataset=str(self.directory), output=str(output), epochs=1,
+            batch_size=2, lr=1e-4, val_fraction=0.5, seed=123,
+            cpu=True, resume=None, wandb=False, temporal=True,
+            sequence_length=4, sequence_stride=2,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.train(args)
+        first = torch.load(output / "bc_last.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(first["policy_type"], "temporal_gru")
+        self.assertEqual(first["sequence_length"], 4)
+        self.assertEqual(first["sequence_stride"], 2)
+        args.resume = str(output / "bc_last.pt")
+        args.epochs = 2
+        args.temporal = False  # Architecture is inferred from the checkpoint.
+        args.sequence_length = None
+        args.sequence_stride = None
+        with contextlib.redirect_stdout(io.StringIO()):
+            bc.train(args)
+        second = torch.load(output / "bc_last.pt", map_location="cpu", weights_only=False)
+        self.assertEqual(second["epoch"], 2)
+        self.assertEqual(second["split"], first["split"])
 
     def test_mixed_modes_are_rejected(self):
         fixed, _ = self.write_demo(False, "demo_00000.hdf5")
@@ -483,6 +561,15 @@ class ObjectRotationTests(unittest.TestCase):
         self.assertEqual(summary["total_successes"], 1)
         self.assertEqual(summary["local_videos_recorded"], 2)
         self.assertEqual(len(list((output / "videos").glob("*.mp4"))), 4)
+        with (output / "bc_eval_steps.csv").open(newline="") as file:
+            steps = list(csv.DictReader(file))
+        self.assertEqual(len(steps), 40)
+        self.assertEqual(steps[0]["step"], "1")
+        self.assertEqual(steps[0]["global_episode"], "1")
+        self.assertAlmostEqual(float(steps[0]["cube_lift_m"]), 0.2)
+        self.assertEqual(steps[20]["global_episode"], "2")
+        self.assertIn("gripper_qpos_after", steps[0])
+        self.assertEqual(summary["step_trace_file"], "bc_eval_steps.csv")
 
 
 if __name__ == "__main__":

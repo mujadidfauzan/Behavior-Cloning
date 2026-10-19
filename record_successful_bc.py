@@ -60,13 +60,7 @@ def main():
     )
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     image_keys = bc.image_keys_from_checkpoint(checkpoint)
-    model = bc.BCPolicy(
-        checkpoint["state_dim"],
-        predict_orientation=checkpoint.get("predict_orientation", False),
-        num_cameras=len(image_keys),
-    ).to(device)
-    model.load_state_dict(checkpoint["model"])
-    model.eval()
+    model = bc.policy_from_checkpoint(checkpoint, device)
     stats = checkpoint["stats"]
     state_mean = np.asarray(stats["state_mean"], dtype=np.float32)
     state_std = np.asarray(stats["state_std"], dtype=np.float32)
@@ -117,6 +111,8 @@ def main():
                     if sampler is not None:
                         propagate_rng(sampler)
                 obs = env.reset()
+                hidden = None
+                previous_gripper = -1.0
                 camera = bc.choose_third_person_camera(env, args.third_person_camera)
                 low, high = env.action_spec
                 initial_z = float(obs["cube_pos"][2])
@@ -153,11 +149,15 @@ def main():
                                 .to(device)
                             )
                             with torch.no_grad():
-                                motion, grip = model(image, state)
+                                motion, grip, hidden = bc.predict_step(
+                                    model, image, state, previous_gripper, hidden
+                                )
                             action = bc.action_from_prediction(
                                 motion[0].cpu().numpy(), grip.item(), stats
                             )
-                            obs, _, _, _ = env.step(np.clip(action, low, high))
+                            action = np.clip(action, low, high)
+                            previous_gripper = float(action[6])
+                            obs, _, _, _ = env.step(action)
                             if args.render:
                                 env.render()
                             lift = float(obs["cube_pos"][2]) - initial_z
@@ -231,6 +231,7 @@ def main():
                     "success_threshold_m": threshold,
                     "hold_steps": hold_steps,
                     "predict_orientation": model.predict_orientation,
+                    "policy_type": checkpoint.get("policy_type", "frame"),
                     "environment_config": environment_config,
                 },
                 indent=2,
